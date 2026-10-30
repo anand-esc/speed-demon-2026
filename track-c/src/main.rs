@@ -2,13 +2,13 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 
 extern "C" {
-    fn mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    fn munmap(addr: *mut u8, length: usize) -> i32;
-    fn madvise(addr: *mut u8, length: usize, advice: i32) -> i32;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 const PROT_READ: i32 = 1;
@@ -20,7 +20,6 @@ struct MmapSlice {
     ptr: *mut u8,
     len: usize,
 }
-
 unsafe impl Send for MmapSlice {}
 unsafe impl Sync for MmapSlice {}
 
@@ -51,7 +50,6 @@ impl MmapSlice {
         }
         Ok(Self { ptr, len })
     }
-
     #[inline(always)]
     fn as_slice(&self) -> &[u8] {
         if self.len == 0 {
@@ -72,52 +70,6 @@ impl Drop for MmapSlice {
     }
 }
 
-struct NameSet {
-    table: Vec<AtomicU64>,
-    mask: usize,
-}
-
-impl NameSet {
-    fn new(size: usize) -> Self {
-        let mut table = Vec::with_capacity(size);
-        for _ in 0..size {
-            table.push(AtomicU64::new(0));
-        }
-        Self {
-            table,
-            mask: size - 1,
-        }
-    }
-
-    #[inline(always)]
-    fn insert(&self, country_id: u8, name_hash: u64) -> bool {
-        let key = (((country_id as u64) + 1) << 56) | (name_hash & 0x00FFFFFFFFFFFFFF);
-        let mut h = name_hash ^ ((country_id as u64).wrapping_mul(0x517cc1b727220a95));
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51afd7ed558ccd);
-        let mut idx = (h as usize) & self.mask;
-
-        loop {
-            let slot = unsafe { self.table.get_unchecked(idx) };
-            let val = slot.load(Ordering::Relaxed);
-            if val == key {
-                return false;
-            }
-            if val == 0 {
-                match slot.compare_exchange_weak(0, key, Ordering::Relaxed, Ordering::Relaxed) {
-                    Ok(_) => return true,
-                    Err(actual) => {
-                        if actual == key {
-                            return false;
-                        }
-                    }
-                }
-            }
-            idx = (idx + 1) & self.mask;
-        }
-    }
-}
-
 #[derive(Clone)]
 struct LocalAgg {
     count: u64,
@@ -130,86 +82,19 @@ struct LocalAgg {
     names_distinct: u32,
 }
 
-impl LocalAgg {
-    fn new() -> Self {
-        Self {
-            count: 0,
-            id_sum: 0,
-            amount_sum: 0,
-            amount_min: i64::MAX,
-            amount_max: i64::MIN,
-            name_bytes: 0,
-            note_bytes: 0,
-            names_distinct: 0,
-        }
-    }
-
-    fn merge(&mut self, other: &LocalAgg) {
-        if other.count == 0 {
-            return;
-        }
-        self.count += other.count;
-        self.id_sum += other.id_sum;
-        self.amount_sum += other.amount_sum;
-        if other.amount_min < self.amount_min {
-            self.amount_min = other.amount_min;
-        }
-        if other.amount_max > self.amount_max {
-            self.amount_max = other.amount_max;
-        }
-        self.name_bytes += other.name_bytes;
-        self.note_bytes += other.note_bytes;
-        self.names_distinct += other.names_distinct;
-    }
-}
-
 fn format_money(cents: i64, out: &mut String) {
     if cents < 0 {
         out.push('-');
     }
     let abs_cents = cents.unsigned_abs();
-    let whole = abs_cents / 100;
-    let frac = abs_cents % 100;
     use std::fmt::Write;
-    write!(out, "{}.{:02}", whole, frac).unwrap();
-}
-
-fn find_record_starts(data: &[u8], body_start: usize, num_chunks: usize) -> Vec<usize> {
-    let mut starts = Vec::with_capacity(num_chunks + 1);
-    starts.push(body_start);
-    let total_len = data.len();
-    let body_len = total_len - body_start;
-
-    for i in 1..num_chunks {
-        let approx = body_start + (i * body_len) / num_chunks;
-        let mut p = approx;
-        while p < total_len {
-            if data[p] == b'\n' {
-                let mut next_p = p + 1;
-                if next_p + 2 < total_len
-                    && data[next_p] == 0xEF
-                    && data[next_p + 1] == 0xBB
-                    && data[next_p + 2] == 0xBF
-                {
-                    next_p += 3;
-                }
-                if next_p < total_len && data[next_p] >= b'0' && data[next_p] <= b'9' {
-                    starts.push(p + 1);
-                    break;
-                }
-            }
-            p += 1;
-        }
-    }
-    starts.push(total_len);
-    starts
+    write!(out, "{}.{:02}", abs_cents / 100, abs_cents % 100).unwrap();
 }
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
-
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--data" && i + 1 < args.len() {
@@ -223,98 +108,106 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    let records_path = format!("{}/records.csv", data_dir);
-    let regions_path = format!("{}/regions.csv", data_dir);
-    let out_path = format!("{}/aggregates.txt", out_dir);
-
-    // 1. Read and parse regions.csv
-    let regions_file = File::open(&regions_path)?;
-    let regions_mmap = MmapSlice::open(&regions_file)?;
-    let regions_data = regions_mmap.as_slice();
-
+    // 1. Fast regions parser
+    let regions_mmap = MmapSlice::open(&File::open(format!("{}/regions.csv", data_dir))?)?;
+    let rdata = regions_mmap.as_slice();
+    let rlen = rdata.len();
     let mut rp = 0;
-    let rlen = regions_data.len();
-    while rp < rlen && regions_data[rp] != b'\n' {
+    while rp < rlen && rdata[rp] != b'\n' {
         rp += 1;
     }
-    if rp < rlen && regions_data[rp] == b'\n' {
+    if rp < rlen {
         rp += 1;
     }
 
-    let mut parsed_regions: Vec<(u32, [u8; 3])> = Vec::with_capacity(200_000);
-    let mut country_set: std::collections::BTreeSet<[u8; 3]> = std::collections::BTreeSet::new();
-    let mut max_region_id: u32 = 0;
+    let mut country_codes: Vec<[u8; 3]> = Vec::with_capacity(256);
+    let mut code_map = [0xFFu8; 26 * 26 * 26];
+    let mut region_to_country = vec![255u8; 1_000_000];
 
     while rp < rlen {
-        let mut rid: u32 = 0;
-        while rp < rlen && regions_data[rp] != b',' {
-            rid = rid * 10 + (regions_data[rp] - b'0') as u32;
+        let mut rid = 0u32;
+        while rp < rlen && rdata[rp] != b',' {
+            rid = rid * 10 + (rdata[rp] - b'0') as u32;
             rp += 1;
         }
         rp += 1;
         if rp + 3 <= rlen {
-            let code = [regions_data[rp], regions_data[rp + 1], regions_data[rp + 2]];
-            country_set.insert(code);
-            parsed_regions.push((rid, code));
-            if rid > max_region_id {
-                max_region_id = rid;
+            let hash = ((rdata[rp] - b'A') as usize) * 676
+                + ((rdata[rp + 1] - b'A') as usize) * 26
+                + ((rdata[rp + 2] - b'A') as usize);
+            let mut cid = code_map[hash];
+            if cid == 0xFF {
+                cid = country_codes.len() as u8;
+                country_codes.push([rdata[rp], rdata[rp + 1], rdata[rp + 2]]);
+                code_map[hash] = cid;
+            }
+            if (rid as usize) < region_to_country.len() {
+                region_to_country[rid as usize] = cid;
             }
             rp += 3;
         }
-        if rp < rlen && regions_data[rp] == b'\r' {
-            rp += 1;
-        }
-        if rp < rlen && regions_data[rp] == b'\n' {
+        while rp < rlen && (rdata[rp] == b'\r' || rdata[rp] == b'\n') {
             rp += 1;
         }
     }
     drop(regions_mmap);
-    drop(regions_file);
 
-    let mut countries_list: Vec<String> = country_set
-        .into_iter()
-        .map(|c| String::from_utf8(c.to_vec()).unwrap())
-        .collect();
-    let unmatched_idx = countries_list.len();
-    countries_list.push("_UNMATCHED".to_string());
-    let num_countries = countries_list.len();
-
-    let mut code_to_idx = std::collections::HashMap::new();
-    for (idx, code_str) in countries_list.iter().enumerate() {
-        code_to_idx.insert(code_str.clone(), idx);
+    let unmatched_cid = country_codes.len() as u8;
+    for x in &mut region_to_country {
+        if *x == 255 {
+            *x = unmatched_cid;
+        }
     }
+    let num_countries = country_codes.len() + 1;
 
-    let mut region_to_country: Vec<u8> = vec![unmatched_idx as u8; (max_region_id + 1) as usize];
-    for (rid, code) in parsed_regions {
-        let code_str = std::str::from_utf8(&code).unwrap();
-        let idx = code_to_idx[code_str];
-        region_to_country[rid as usize] = idx as u8;
-    }
-
-    // 2. Open records.csv
-    let records_file = File::open(&records_path)?;
-    let records_mmap = MmapSlice::open(&records_file)?;
+    // 2. Map records.csv
+    let records_mmap = MmapSlice::open(&File::open(format!("{}/records.csv", data_dir))?)?;
     let data = records_mmap.as_slice();
     let len = data.len();
 
     let mut body_start = 0;
-    if len >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+    if data.starts_with(b"\xEF\xBB\xBF") {
         body_start = 3;
     }
     while body_start < len && data[body_start] != b'\n' {
         body_start += 1;
     }
-    if body_start < len && data[body_start] == b'\n' {
+    if body_start < len {
         body_start += 1;
     }
+
+    const TABLE_SIZE: usize = 262_144;
+    let name_table: Vec<AtomicU64> = (0..TABLE_SIZE).map(|_| AtomicU64::new(0)).collect();
+    let next_id_block = AtomicU32::new(0);
+    let country_bitsets: Vec<AtomicU64> = (0..num_countries * 2048)
+        .map(|_| AtomicU64::new(0))
+        .collect();
 
     let num_threads = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(12)
         .min(12);
-    let starts = find_record_starts(data, body_start, num_threads);
-
-    let name_set = NameSet::new(8_388_608);
+    let mut starts = Vec::with_capacity(num_threads + 1);
+    starts.push(body_start);
+    let body_len = len - body_start;
+    for t in 1..num_threads {
+        let mut p = body_start + (t * body_len) / num_threads;
+        while p < len {
+            if data[p] == b'\n' {
+                let mut np = p + 1;
+                if np + 2 < len && data[np] == 0xEF && data[np + 1] == 0xBB && data[np + 2] == 0xBF
+                {
+                    np += 3;
+                }
+                if np < len && data[np] >= b'0' && data[np] <= b'9' {
+                    starts.push(p + 1);
+                    break;
+                }
+            }
+            p += 1;
+        }
+    }
+    starts.push(len);
 
     let thread_aggs = thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
@@ -322,10 +215,27 @@ fn main() -> std::io::Result<()> {
             let chunk_start = starts[t];
             let chunk_end = starts[t + 1];
             let region_to_country = &region_to_country;
-            let name_set = &name_set;
+            let name_table = &name_table;
+            let next_id_block = &next_id_block;
+            let country_bitsets = &country_bitsets;
 
             handles.push(s.spawn(move || {
-                let mut local_aggs = vec![LocalAgg::new(); num_countries];
+                let mut local_aggs = vec![
+                    LocalAgg {
+                        count: 0,
+                        id_sum: 0,
+                        amount_sum: 0,
+                        amount_min: i64::MAX,
+                        amount_max: i64::MIN,
+                        name_bytes: 0,
+                        note_bytes: 0,
+                        names_distinct: 0,
+                    };
+                    num_countries
+                ];
+
+                let mut cur_id = 0u32;
+                let mut max_id = 0u32;
                 let mut p = chunk_start;
 
                 while p < chunk_end {
@@ -340,7 +250,7 @@ fn main() -> std::io::Result<()> {
                     }
 
                     // 1. Parse id
-                    let mut id: u64 = 0;
+                    let mut id = 0u64;
                     loop {
                         let b = unsafe { *data.get_unchecked(p) };
                         if b == b',' {
@@ -352,8 +262,8 @@ fn main() -> std::io::Result<()> {
                     }
 
                     // 2. Parse name
-                    let mut name_hash: u64 = 0xcbf29ce484222325;
-                    let mut name_len: u32 = 0;
+                    let mut nh: u64 = 0xcbf29ce484222325;
+                    let mut name_len = 0u32;
                     let b = unsafe { *data.get_unchecked(p) };
                     if b == b'"' {
                         p += 1;
@@ -361,8 +271,7 @@ fn main() -> std::io::Result<()> {
                             let curr = unsafe { *data.get_unchecked(p) };
                             if curr == b'"' {
                                 if p + 1 < len && unsafe { *data.get_unchecked(p + 1) == b'"' } {
-                                    name_hash =
-                                        (name_hash ^ (b'"' as u64)).wrapping_mul(0x100000001b3);
+                                    nh = (nh ^ (b'"' as u64)).wrapping_mul(0x100000001b3);
                                     name_len += 1;
                                     p += 2;
                                 } else {
@@ -370,18 +279,24 @@ fn main() -> std::io::Result<()> {
                                     break;
                                 }
                             } else {
-                                name_hash = (name_hash ^ (curr as u64)).wrapping_mul(0x100000001b3);
+                                nh = (nh ^ (curr as u64)).wrapping_mul(0x100000001b3);
                                 name_len += 1;
                                 p += 1;
                             }
                         }
                         p += 1;
                     } else {
+                        while unsafe { *data.get_unchecked(p) } != b',' {
+                            let curr = unsafe { *data.get_unchecked(p) };
+                            nh = (nh ^ (curr as u64)).wrapping_mul(0x100000001b3);
+                            name_len += 1;
+                            p += 1;
+                        }
                         p += 1;
                     }
 
                     // 3. Parse note
-                    let mut note_len: u32 = 0;
+                    let mut note_len = 0u32;
                     let b = unsafe { *data.get_unchecked(p) };
                     if b == b'"' {
                         p += 1;
@@ -402,18 +317,22 @@ fn main() -> std::io::Result<()> {
                         }
                         p += 1;
                     } else {
+                        while unsafe { *data.get_unchecked(p) } != b',' {
+                            note_len += 1;
+                            p += 1;
+                        }
                         p += 1;
                     }
 
                     // 4. Parse region_id
-                    let mut region_id: u32 = 0;
+                    let mut rid = 0u32;
                     loop {
                         let b = unsafe { *data.get_unchecked(p) };
                         if b == b',' {
                             p += 1;
                             break;
                         }
-                        region_id = region_id * 10 + (b - b'0') as u32;
+                        rid = rid * 10 + (b - b'0') as u32;
                         p += 1;
                     }
 
@@ -424,8 +343,7 @@ fn main() -> std::io::Result<()> {
                     } else {
                         false
                     };
-
-                    let mut cents: i64 = 0;
+                    let mut cents = 0i64;
                     loop {
                         let b = unsafe { *data.get_unchecked(p) };
                         if b == b'.' {
@@ -450,14 +368,13 @@ fn main() -> std::io::Result<()> {
                         p += 1;
                     }
 
-                    // Aggregation
-                    let country_id = if (region_id as usize) < region_to_country.len() {
-                        unsafe { *region_to_country.get_unchecked(region_id as usize) as usize }
+                    let cid = if (rid as usize) < region_to_country.len() {
+                        unsafe { *region_to_country.get_unchecked(rid as usize) as usize }
                     } else {
-                        unmatched_idx
+                        unmatched_cid as usize
                     };
 
-                    let agg = unsafe { local_aggs.get_unchecked_mut(country_id) };
+                    let agg = unsafe { local_aggs.get_unchecked_mut(cid) };
                     agg.count += 1;
                     agg.id_sum += id as i64;
                     agg.amount_sum += cents;
@@ -470,55 +387,141 @@ fn main() -> std::io::Result<()> {
                     agg.name_bytes += name_len as u64;
                     agg.note_bytes += note_len as u64;
 
-                    if name_set.insert(country_id as u8, name_hash) {
-                        agg.names_distinct += 1;
+                    // Assign or look up name_id
+                    let h47 = nh & 0x7FFFFFFFFFFF;
+                    let mut slot_idx = (nh as usize) & (TABLE_SIZE - 1);
+                    let nid: u32;
+                    loop {
+                        let slot = unsafe { name_table.get_unchecked(slot_idx) };
+                        let val = slot.load(Ordering::Relaxed);
+                        if val == 0 {
+                            if cur_id >= max_id {
+                                cur_id = next_id_block.fetch_add(512, Ordering::Relaxed);
+                                max_id = cur_id + 512;
+                            }
+                            let cand_id = cur_id;
+                            cur_id += 1;
+                            let cand_val = (h47 << 17) | ((cand_id + 1) as u64);
+                            match slot.compare_exchange(
+                                0,
+                                cand_val,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => {
+                                    nid = cand_id;
+                                    break;
+                                }
+                                Err(actual) => {
+                                    if (actual >> 17) == h47 {
+                                        nid = (actual & 0x1FFFF) as u32 - 1;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else if (val >> 17) == h47 {
+                            nid = (val & 0x1FFFF) as u32 - 1;
+                            break;
+                        }
+                        slot_idx = (slot_idx + 1) & (TABLE_SIZE - 1);
+                    }
+
+                    // Test and set bit for this country
+                    let bit_word_idx = cid * 2048 + (nid as usize >> 6);
+                    let mask = 1u64 << (nid & 63);
+                    let slot = unsafe { country_bitsets.get_unchecked(bit_word_idx) };
+                    let val = slot.load(Ordering::Relaxed);
+                    if (val & mask) == 0 {
+                        let prev = slot.fetch_or(mask, Ordering::Relaxed);
+                        if (prev & mask) == 0 {
+                            agg.names_distinct += 1;
+                        }
                     }
                 }
                 local_aggs
             }));
         }
-
-        let mut all_results = Vec::with_capacity(num_threads);
+        let mut res = Vec::with_capacity(num_threads);
         for h in handles {
-            all_results.push(h.join().unwrap());
+            res.push(h.join().unwrap());
         }
-        all_results
+        res
     });
 
-    // Merge thread aggregates
-    let mut final_aggs = vec![LocalAgg::new(); num_countries];
-    for t_agg in thread_aggs {
-        for (i, item) in t_agg.iter().enumerate() {
-            final_aggs[i].merge(item);
+    let mut final_aggs = vec![
+        LocalAgg {
+            count: 0,
+            id_sum: 0,
+            amount_sum: 0,
+            amount_min: i64::MAX,
+            amount_max: i64::MIN,
+            name_bytes: 0,
+            note_bytes: 0,
+            names_distinct: 0,
+        };
+        num_countries
+    ];
+
+    for tagg in thread_aggs {
+        for (i, item) in tagg.iter().enumerate() {
+            let f = &mut final_aggs[i];
+            f.count += item.count;
+            f.id_sum += item.id_sum;
+            f.amount_sum += item.amount_sum;
+            if item.amount_min < f.amount_min {
+                f.amount_min = item.amount_min;
+            }
+            if item.amount_max > f.amount_max {
+                f.amount_max = item.amount_max;
+            }
+            f.name_bytes += item.name_bytes;
+            f.note_bytes += item.note_bytes;
+            f.names_distinct += item.names_distinct;
         }
     }
 
-    // Format output
-    let mut out_str = String::with_capacity(32 * 1024);
-    for (i, agg) in final_aggs.iter().enumerate() {
+    let mut country_indices: Vec<usize> = (0..country_codes.len()).collect();
+    country_indices.sort_by_key(|&idx| country_codes[idx]);
+
+    let mut out = String::with_capacity(32 * 1024);
+    for idx in country_indices {
+        let agg = &final_aggs[idx];
         if agg.count > 0 {
-            out_str.push_str(&countries_list[i]);
-            out_str.push(' ');
+            let code = std::str::from_utf8(&country_codes[idx]).unwrap();
             use std::fmt::Write;
-            write!(&mut out_str, "{} {} ", agg.count, agg.id_sum).unwrap();
-            format_money(agg.amount_sum, &mut out_str);
-            out_str.push(' ');
-            format_money(agg.amount_min, &mut out_str);
-            out_str.push(' ');
-            format_money(agg.amount_max, &mut out_str);
-            out_str.push(' ');
+            write!(&mut out, "{} {} {} ", code, agg.count, agg.id_sum).unwrap();
+            format_money(agg.amount_sum, &mut out);
+            out.push(' ');
+            format_money(agg.amount_min, &mut out);
+            out.push(' ');
+            format_money(agg.amount_max, &mut out);
             writeln!(
-                &mut out_str,
-                "{} {} {}",
+                &mut out,
+                " {} {} {}",
                 agg.names_distinct, agg.name_bytes, agg.note_bytes
             )
             .unwrap();
         }
     }
+    let agg = &final_aggs[unmatched_cid as usize];
+    if agg.count > 0 {
+        use std::fmt::Write;
+        write!(&mut out, "_UNMATCHED {} {} ", agg.count, agg.id_sum).unwrap();
+        format_money(agg.amount_sum, &mut out);
+        out.push(' ');
+        format_money(agg.amount_min, &mut out);
+        out.push(' ');
+        format_money(agg.amount_max, &mut out);
+        writeln!(
+            &mut out,
+            " {} {} {}",
+            agg.names_distinct, agg.name_bytes, agg.note_bytes
+        )
+        .unwrap();
+    }
 
     std::fs::create_dir_all(&out_dir)?;
-    let mut out_file = File::create(&out_path)?;
-    out_file.write_all(out_str.as_bytes())?;
-
+    let mut out_file = File::create(format!("{}/aggregates.txt", out_dir))?;
+    out_file.write_all(out.as_bytes())?;
     Ok(())
 }
