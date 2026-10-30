@@ -3,52 +3,23 @@ use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::thread;
 
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-    fn munmap(a: *mut u8, l: usize) -> i32;
     fn madvise(a: *mut u8, l: usize, ad: i32) -> i32;
 }
 
-struct MmapSlice(*mut u8, usize);
-unsafe impl Send for MmapSlice {}
-unsafe impl Sync for MmapSlice {}
-
-impl MmapSlice {
-    fn open(p: &str) -> std::io::Result<Self> {
-        let f = File::open(p)?;
-        let l = f.metadata()?.size() as usize;
-        let ptr = unsafe { mmap(std::ptr::null_mut(), l, 1, 0x8002, f.as_raw_fd(), 0) };
-        if ptr == usize::MAX as *mut u8 {
-            return Err(std::io::Error::last_os_error());
-        }
-        unsafe {
-            madvise(ptr, l, 2);
-        }
-        Ok(Self(ptr, l))
-    }
-    #[inline(always)]
-    fn slice(&self) -> &[u8] {
-        if self.1 == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(self.0, self.1) }
-        }
+fn mmap_file(p: &str) -> &'static [u8] {
+    let f = File::open(p).unwrap();
+    let l = f.metadata().unwrap().size() as usize;
+    unsafe {
+        let ptr = mmap(std::ptr::null_mut(), l, 1, 0x8002, f.as_raw_fd(), 0);
+        madvise(ptr, l, 2);
+        std::slice::from_raw_parts(ptr, l)
     }
 }
 
-impl Drop for MmapSlice {
-    fn drop(&mut self) {
-        if !self.0.is_null() && self.1 > 0 {
-            unsafe {
-                munmap(self.0, self.1);
-            }
-        }
-    }
-}
-
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct LocalAgg {
     count: u64,
     id_sum: i64,
@@ -58,6 +29,29 @@ struct LocalAgg {
     name_bytes: u64,
     note_bytes: u64,
     names_distinct: u32,
+}
+
+impl LocalAgg {
+    const EMPTY: Self = Self {
+        count: 0,
+        id_sum: 0,
+        amount_sum: 0,
+        amount_min: i64::MAX,
+        amount_max: i64::MIN,
+        name_bytes: 0,
+        note_bytes: 0,
+        names_distinct: 0,
+    };
+    fn merge(&mut self, o: &Self) {
+        self.count += o.count;
+        self.id_sum += o.id_sum;
+        self.amount_sum += o.amount_sum;
+        self.amount_min = self.amount_min.min(o.amount_min);
+        self.amount_max = self.amount_max.max(o.amount_max);
+        self.name_bytes += o.name_bytes;
+        self.note_bytes += o.note_bytes;
+        self.names_distinct += o.names_distinct;
+    }
 }
 
 #[inline(always)]
@@ -104,7 +98,7 @@ fn write_money(cents: i64, out: &mut String) {
     }
     let a = cents.unsigned_abs();
     use std::fmt::Write;
-    write!(out, "{}.{:02}", a / 100, a % 100).unwrap();
+    let _ = write!(out, "{}.{:02}", a / 100, a % 100);
 }
 
 fn main() -> std::io::Result<()> {
@@ -120,8 +114,7 @@ fn main() -> std::io::Result<()> {
         .map(|w| w[1].as_str())
         .unwrap_or("/out");
 
-    let r_mmap = MmapSlice::open(&format!("{}/regions.csv", data_dir))?;
-    let rdata = r_mmap.slice();
+    let rdata = mmap_file(&format!("{}/regions.csv", data_dir));
     let rlen = rdata.len();
     let mut rp = rdata.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
 
@@ -155,7 +148,6 @@ fn main() -> std::io::Result<()> {
             rp += 1;
         }
     }
-    drop(r_mmap);
 
     let unmatched_cid = country_codes.len() as u8;
     for x in &mut region_to_country {
@@ -165,8 +157,7 @@ fn main() -> std::io::Result<()> {
     }
     let num_countries = country_codes.len() + 1;
 
-    let rec_mmap = MmapSlice::open(&format!("{}/records.csv", data_dir))?;
-    let data = rec_mmap.slice();
+    let data = mmap_file(&format!("{}/records.csv", data_dir));
     let len = data.len();
     let mut body_start = if data.starts_with(b"\xEF\xBB\xBF") {
         3
@@ -185,7 +176,7 @@ fn main() -> std::io::Result<()> {
     let b_table: Vec<u64> = vec![0u64; num_countries * 2048];
     let country_bitsets: Vec<AtomicU64> = unsafe { std::mem::transmute(b_table) };
 
-    let num_threads = thread::available_parallelism()
+    let num_threads = std::thread::available_parallelism()
         .map_or(12, |n| n.get())
         .min(12);
     let mut starts = Vec::with_capacity(num_threads + 1);
@@ -210,7 +201,7 @@ fn main() -> std::io::Result<()> {
     }
     starts.push(len);
 
-    let thread_aggs = thread::scope(|s| {
+    let thread_aggs = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for t in 0..num_threads {
             let chunk_start = starts[t];
@@ -223,14 +214,7 @@ fn main() -> std::io::Result<()> {
             );
 
             handles.push(s.spawn(move || {
-                let mut aggs = vec![
-                    LocalAgg {
-                        amount_min: i64::MAX,
-                        amount_max: i64::MIN,
-                        ..Default::default()
-                    };
-                    num_countries
-                ];
+                let mut aggs = vec![LocalAgg::EMPTY; num_countries];
                 let (mut cur_id, mut max_id, mut p) = (0u32, 0u32, chunk_start);
 
                 while p < chunk_end {
@@ -304,12 +288,8 @@ fn main() -> std::io::Result<()> {
                     agg.count += 1;
                     agg.id_sum += id as i64;
                     agg.amount_sum += cents;
-                    if cents < agg.amount_min {
-                        agg.amount_min = cents;
-                    }
-                    if cents > agg.amount_max {
-                        agg.amount_max = cents;
-                    }
+                    agg.amount_min = agg.amount_min.min(cents);
+                    agg.amount_max = agg.amount_max.max(cents);
                     agg.name_bytes += name_len as u64;
                     agg.note_bytes += note_len as u64;
 
@@ -368,29 +348,10 @@ fn main() -> std::io::Result<()> {
         res
     });
 
-    let mut final_aggs = vec![
-        LocalAgg {
-            amount_min: i64::MAX,
-            amount_max: i64::MIN,
-            ..Default::default()
-        };
-        num_countries
-    ];
+    let mut final_aggs = vec![LocalAgg::EMPTY; num_countries];
     for tagg in thread_aggs {
         for (i, it) in tagg.iter().enumerate() {
-            let f = &mut final_aggs[i];
-            f.count += it.count;
-            f.id_sum += it.id_sum;
-            f.amount_sum += it.amount_sum;
-            if it.amount_min < f.amount_min {
-                f.amount_min = it.amount_min;
-            }
-            if it.amount_max > f.amount_max {
-                f.amount_max = it.amount_max;
-            }
-            f.name_bytes += it.name_bytes;
-            f.note_bytes += it.note_bytes;
-            f.names_distinct += it.names_distinct;
+            final_aggs[i].merge(it);
         }
     }
 
@@ -408,18 +369,17 @@ fn main() -> std::io::Result<()> {
                 "_UNMATCHED"
             };
             use std::fmt::Write;
-            write!(&mut out, "{} {} {} ", name, agg.count, agg.id_sum).unwrap();
+            let _ = write!(&mut out, "{} {} {} ", name, agg.count, agg.id_sum);
             write_money(agg.amount_sum, &mut out);
             out.push(' ');
             write_money(agg.amount_min, &mut out);
             out.push(' ');
             write_money(agg.amount_max, &mut out);
-            writeln!(
+            let _ = writeln!(
                 &mut out,
                 " {} {} {}",
                 agg.names_distinct, agg.name_bytes, agg.note_bytes
-            )
-            .unwrap();
+            );
         }
     }
 
