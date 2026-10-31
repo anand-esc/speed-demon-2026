@@ -77,3 +77,20 @@ Every step from naive to final, with measurements and run IDs.
   - **Zero-Collision 64-bit Exact Tagging:** Full 64-bit hash validation ensures zero false positives while keeping the table entirely stack-allocated within the thread's cache boundary.
 - **Local Measurement:** 0.142 s local runtime (projected **~0.017–0.019 s** on Hetzner scoring box).
 - **Correctness:** Verified SHA-256 match `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536` on full seed-1 dataset.
+
+## Step 8: Zero-Based Unmatched Region Join, Inlined Raw Pointer Pipeline, Stack Footprint Elimination & Popcnt Bound Truncation
+- **Bottlenecks identified in Step 7:**
+  1. The 4096-entry thread-local `n_cache` had an actual hit rate of only ~5% against 100,520 names, meaning 95% of records wasted cycles doing a cache probe before falling through to `name_table`.
+  2. `region_to_country` used 255 for unmatched, requiring a secondary conditional branch at every row (`if cid == 255`) and separate initialization.
+  3. Function call overhead and slice indexing in `parse_fast` (`p: &mut usize`, `data: &[u8]`) caused repeated bounds checks and register spilling.
+  4. Post-run popcnt reduction scanned all 2048 words (131,072 bits) for every single country, even though fewer than 1571 words were ever allocated and inactive countries have 0 records.
+- **Optimisations:**
+  1. **Zero-Based Unmatched Region Join:** Assigned `_UNMATCHED` to country ID `0`, and matched countries to `1..240`. In zero-initialized memory, any unknown region ID automatically resolves to `0` in a single `r2c[rid]` load with zero secondary branches.
+  2. **Inlined Raw Pointer Pipeline:** Completely inlined record parsing into the worker thread loop using raw pointers (`*const u8`), eliminating slice indexing, `&mut usize` pointer indirection, and tuple return register spills.
+  3. **Direct L3-Resident Name Table with Hot-Path Reordering:** Reordered `name_table` probing to evaluate the hot path (`(val >> 17) == h47`) first before checking `val == 0`. Eliminated `n_cache`, saving 768 KB of thread stack memory and avoiding cache-miss probe overhead on every record.
+  4. **16-Bit Unaligned Currency Fraction Read:** Loaded the 2-digit fraction after `.` in a single 16-bit unaligned load (`read_unaligned`), eliminating multiple byte operations.
+  5. **Popcnt Bound Truncation & Zero-Count Bypass:** Truncated the bitset reduction loop to `(max_nid + 63) / 64` (skipping ~500 unallocated words per country) and bypassed countries with `count == 0` entirely.
+  6. **Cross-Platform UNIX/Non-UNIX Support:** Added `#[cfg(unix)]` mmap and `#[cfg(not(unix))]` fallback for zero-dependency local cross-compilation and benchmarking.
+- **Local Measurement:** Parallel worker thread execution dropped from 85.6 ms to **43.7 ms** (~1.96x faster). Projected **~0.012–0.015 s** on Hetzner scoring box.
+- **Memory:** Zero-initialized region table, zero thread-local cache footprint, minimal resident page faults.
+- **Correctness:** Verified SHA-256 match `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536` on full seed-1 dataset and `9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66` on sample seed-1 dataset.
