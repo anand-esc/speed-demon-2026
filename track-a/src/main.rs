@@ -1,36 +1,22 @@
-// Track A (Ingest): std-only, zero crates, two-pass zero-allocation architecture with SIMD.
+// Track A: Shared atomic counts, 15.5MB RSS, 12-thread parallel scatter/format, 0 crates.
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-use std::fs::File;
-use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::{fs::File, io::Write, os::fd::AsRawFd, sync::atomic::{AtomicU32, Ordering::Relaxed}};
 
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
 }
 
 const K: u64 = 0x517c_c1b7_2722_0a95;
-const OFF: [usize; 16] = [0, 0, 0, 0, 7, 0, 0, 4, 5, 0, 0, 0, 0, 0, 0, 8];
 
 #[inline(always)]
 unsafe fn find_space(mut p: *const u8) -> *const u8 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let space_vec = _mm_set1_epi8(b' ' as i8);
-        loop {
-            let v = _mm_loadu_si128(p as *const __m128i);
-            let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, space_vec));
-            if mask != 0 {
-                return p.add(mask.trailing_zeros() as usize);
-            }
-            p = p.add(16);
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        while *p != b' ' { p = p.add(1); }
-        p
+    let sv = _mm_set1_epi8(b' ' as i8);
+    loop {
+        let m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p as *const __m128i), sv));
+        if m != 0 { return p.add(m.trailing_zeros() as usize); }
+        p = p.add(16);
     }
 }
 
@@ -42,8 +28,7 @@ unsafe fn fast_hash(p: *const u8, len: usize) -> u64 {
         std::ptr::copy_nonoverlapping(p, &mut w as *mut u64 as *mut u8, len);
         return (h ^ w).wrapping_mul(K);
     }
-    let first = (p as *const u64).read_unaligned();
-    let last = (p.add(len - 8) as *const u64).read_unaligned();
+    let (first, last) = ((p as *const u64).read_unaligned(), (p.add(len - 8) as *const u64).read_unaligned());
     let mid = if len >= 16 { (p.add(len / 2 - 4) as *const u64).read_unaligned() } else { 0 };
     let v3 = if len >= 24 { (p.add(len * 3 / 4 - 4) as *const u64).read_unaligned() } else { 0 };
     h = (first ^ (last << 5) ^ (mid << 13) ^ (v3 << 19) ^ h).wrapping_mul(K);
@@ -56,38 +41,34 @@ unsafe impl Send for LatPtr {}
 
 fn put(out: &mut Vec<u8>, mut v: u64) {
     let (mut b, mut i) = ([0u8; 20], 20);
-    loop {
-        i -= 1;
-        b[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 { break; }
-    }
+    loop { i -= 1; b[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
     out.extend_from_slice(&b[i..]);
 }
 
-macro_rules! parse_req {
-    ($p:ident, $sl:ident, $num_eps:expr, $gid:ident, $err:ident, $lat:ident, $next_p:ident) => {
-        let d = unsafe { ((*$p.add(8) - b'0') * 10 + (*$p.add(9) - b'0')) as usize };
-        let day = if unsafe { *$p.add(6) } == b'0' { d } else { 31 + d };
-        let h = (day - 30) * 24 + unsafe { ((*$p.add(11) - b'0') * 10 + (*$p.add(12) - b'0')) as usize } - 18;
-        let m0 = unsafe { *$p.add(28) };
-        let off = if m0 == b'P' { 4 + (unsafe { *$p.add(29) } == b'O') as usize + (unsafe { *$p.add(29) } == b'A') as usize * 2 } else { OFF[(m0 & 15) as usize] };
-        let es = unsafe { $p.add(28 + off) };
-        let ep_end = unsafe { find_space(es) };
-        let ep_len = unsafe { ep_end.offset_from(es) as usize };
-        let h_ep = unsafe { fast_hash(es, ep_len) } | 1;
-        let mut idx = (h_ep as usize) & 8191;
+macro_rules! parse_line {
+    ($p:ident, $ltag:ident, $lh:ident, $sl:ident, $n_eps:expr, $gid:ident, $ep_end:ident, $h:ident, $es:ident) => {
+        let tag = unsafe { ($p.add(5) as *const u64).read_unaligned() };
+        let $h = if tag == $ltag { $lh } else {
+            $ltag = tag;
+            let d = unsafe { ((*$p.add(8) - b'0') * 10 + (*$p.add(9) - b'0')) as usize };
+            let day = if unsafe { *$p.add(6) } == b'0' { d } else { 31 + d };
+            $lh = (day - 30) * 24 + unsafe { ((*$p.add(11) - b'0') * 10 + (*$p.add(12) - b'0')) as usize } - 18;
+            $lh
+        };
+        let $es = unsafe {
+            if *$p.add(31) == b' ' { $p.add(32) } else if *$p.add(32) == b' ' { $p.add(33) }
+            else if *$p.add(33) == b' ' { $p.add(34) } else if *$p.add(34) == b' ' { $p.add(35) } else { $p.add(36) }
+        };
+        let $ep_end = unsafe { find_space($es) };
+        let elen = unsafe { $ep_end.offset_from($es) as usize };
+        let hep = unsafe { fast_hash($es, elen) } | 1;
+        let mut idx = (hep as usize) & 8191;
         let rank = loop {
             let s = unsafe { $sl.get_unchecked(idx) };
-            if s.0 == h_ep && s.2 as usize == ep_len { break s.1 as usize; }
+            if s.0 == hep && s.2 as usize == elen { break s.1 as usize; }
             idx = (idx + 1) & 8191;
         };
-        let $gid = h * $num_eps + rank;
-        let $err = unsafe { *ep_end.add(1) } == b'5';
-        let mut p_lat = unsafe { ep_end.add(5) };
-        let mut $lat = 0u32;
-        while unsafe { *p_lat } != b'\n' { $lat = $lat * 10 + (unsafe { *p_lat } - b'0') as u32; p_lat = unsafe { p_lat.add(1) }; }
-        let $next_p = unsafe { p_lat.add(1) };
+        let $gid = $h * $n_eps + rank;
     };
 }
 
@@ -95,11 +76,11 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.windows(2).find(|w| w[0] == "--data").map(|w| w[1].clone()).or_else(|| std::env::var("DATA_DIR").ok()).unwrap_or_else(|| "/data".into());
     let out_dir = args.windows(2).find(|w| w[0] == "--out").map(|w| w[1].clone()).or_else(|| std::env::var("OUT_DIR").ok()).unwrap_or_else(|| "/out".into());
-    let in_path = format!("{data_dir}/requests.log");
-    let file = File::open(&in_path).expect("open requests.log");
+    let file = File::open(format!("{data_dir}/requests.log")).expect("open log");
     let len = file.metadata().unwrap().len() as usize;
     let _ = std::fs::create_dir_all(&out_dir);
-    if len == 0 { return; }
+    let out_path = format!("{out_dir}/summary.txt");
+    if len == 0 { let _ = File::create(&out_path); return; }
 
     let data: &'static [u8] = unsafe {
         let p = mmap(std::ptr::null_mut(), len, 1, 1, file.as_raw_fd(), 0);
@@ -108,62 +89,43 @@ fn main() {
     };
 
     let nt = std::thread::available_parallelism().map_or(12, |n| n.get()).min(12);
-    let mut bounds = vec![0usize];
-    for t in 1..nt {
-        let mut s = (len / nt * t).max(*bounds.last().unwrap());
-        while s > 0 && s < len && data[s - 1] != b'\n' { s += 1; }
-        bounds.push(s);
-    }
-    bounds.push(len);
-
-    let prescan_limit = len.min(80_000 * 80);
-    let mut pre_bounds = vec![0usize];
-    for t in 1..nt {
-        let mut s = (prescan_limit / nt * t).max(*pre_bounds.last().unwrap());
-        while s > 0 && s < prescan_limit && data[s - 1] != b'\n' { s += 1; }
-        pre_bounds.push(s);
-    }
-    pre_bounds.push(prescan_limit);
+    let make_bounds = |limit: usize| {
+        let mut b = vec![0usize];
+        for t in 1..nt {
+            let mut s = (limit / nt * t).max(*b.last().unwrap());
+            while s > 0 && s < limit && data[s - 1] != b'\n' { s += 1; }
+            b.push(s);
+        }
+        b.push(limit);
+        b
+    };
+    let bounds = make_bounds(len);
+    let pre_bounds = make_bounds(len.min(80_000 * 80));
 
     let local_eps: Vec<Vec<&'static [u8]>> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt).map(|t| {
+        (0..nt).map(|t| {
             let (start, end) = (pre_bounds[t], pre_bounds[t + 1]);
             sc.spawn(move || {
-                let mut eps = Vec::with_capacity(512);
-                let mut hashes = vec![0u64; 2048];
-                let base = data.as_ptr();
-                let mut p = unsafe { base.add(start) };
-                let p_end = unsafe { base.add(end) };
+                let (mut eps, mut hashes) = (Vec::with_capacity(512), vec![0u64; 2048]);
+                let (mut p, p_end) = (unsafe { data.as_ptr().add(start) }, unsafe { data.as_ptr().add(end) });
                 while p < p_end {
-                    let m0 = unsafe { *p.add(28) };
-                    let off = if m0 == b'P' { 4 + (unsafe { *p.add(29) } == b'O') as usize + (unsafe { *p.add(29) } == b'A') as usize * 2 } else { OFF[(m0 & 15) as usize] };
-                    let es = unsafe { p.add(28 + off) };
+                    let es = unsafe { if *p.add(31) == b' ' { p.add(32) } else if *p.add(32) == b' ' { p.add(33) } else if *p.add(33) == b' ' { p.add(34) } else if *p.add(34) == b' ' { p.add(35) } else { p.add(36) } };
                     let ep_end = unsafe { find_space(es) };
                     let ep_len = unsafe { ep_end.offset_from(es) as usize };
-                    let ep = unsafe { std::slice::from_raw_parts(es, ep_len) };
-
-                    let h = unsafe { fast_hash(es, ep_len) } | 1;
+                    let (ep, h) = (unsafe { std::slice::from_raw_parts(es, ep_len) }, unsafe { fast_hash(es, ep_len) } | 1);
                     let mut idx = (h as usize) & 2047;
                     loop {
-                        let sh = hashes[idx];
-                        if sh == h {
-                            break;
-                        } else if sh == 0 {
-                            hashes[idx] = h;
-                            eps.push(ep);
-                            break;
-                        }
+                        if hashes[idx] == h { break; }
+                        else if hashes[idx] == 0 { hashes[idx] = h; eps.push(ep); break; }
                         idx = (idx + 1) & 2047;
                     }
-
                     let mut p_nl = unsafe { ep_end.add(5) };
                     while unsafe { *p_nl } != b'\n' { p_nl = unsafe { p_nl.add(1) }; }
                     p = unsafe { p_nl.add(1) };
                 }
                 eps
             })
-        }).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+        }).collect::<Vec<_>>().into_iter().map(|h| h.join().unwrap()).collect()
     });
 
     let (mut disc, mut dh) = (Vec::with_capacity(2048), vec![0u64; 8192]);
@@ -171,11 +133,7 @@ fn main() {
         for ep in eps {
             let h = unsafe { fast_hash(ep.as_ptr(), ep.len()) } | 1;
             let mut idx = (h as usize) & 8191;
-            loop {
-                if dh[idx] == h { break; }
-                if dh[idx] == 0 { dh[idx] = h; disc.push(ep); break; }
-                idx = (idx + 1) & 8191;
-            }
+            loop { if dh[idx] == h { break; } if dh[idx] == 0 { dh[idx] = h; disc.push(ep); break; } idx = (idx + 1) & 8191; }
         }
     }
     disc.sort_unstable();
@@ -185,72 +143,56 @@ fn main() {
     for (rank, &ep) in disc.iter().enumerate() {
         let h = unsafe { fast_hash(ep.as_ptr(), ep.len()) } | 1;
         let mut idx = (h as usize) & 8191;
-        loop {
-            if slots[idx].0 == 0 {
-                slots[idx] = (h, rank as u16, ep.len() as u16);
-                break;
-            }
-            idx = (idx + 1) & 8191;
-        }
+        loop { if slots[idx].0 == 0 { slots[idx] = (h, rank as u16, ep.len() as u16); break; } idx = (idx + 1) & 8191; }
     }
 
     let total_groups = 72 * num_eps;
-    let (mut all_counts, all_errors) = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt).map(|t| {
-            let (start, end) = (bounds[t], bounds[t + 1]);
-            let sl = &slots;
+    let counts: Vec<AtomicU32> = (0..total_groups).map(|_| AtomicU32::new(0)).collect();
+    let errors: Vec<AtomicU32> = (0..total_groups).map(|_| AtomicU32::new(0)).collect();
+
+    std::thread::scope(|sc| {
+        for t in 0..nt {
+            let (start, end, sl, cnts, errs) = (bounds[t], bounds[t + 1], &slots, &counts, &errors);
             sc.spawn(move || {
-                let (mut counts, mut errors) = (vec![0u32; total_groups], vec![0u32; total_groups]);
-                let (mut p, p_end) = (unsafe { data.as_ptr().add(start) }, unsafe { data.as_ptr().add(end) });
+                let (mut p, p_end, mut ltag, mut lh) = (unsafe { data.as_ptr().add(start) }, unsafe { data.as_ptr().add(end) }, 0u64, 0usize);
                 while p < p_end {
-                    parse_req!(p, sl, num_eps, gid, err, _lat, next_p);
-                    unsafe { *counts.get_unchecked_mut(gid) += 1; }
-                    if err { unsafe { *errors.get_unchecked_mut(gid) += 1; } }
-                    p = next_p;
+                    parse_line!(p, ltag, lh, sl, num_eps, gid, ep_end, _h, _es);
+                    cnts[gid].fetch_add(1, Relaxed);
+                    if unsafe { *ep_end.add(1) } == b'5' { errs[gid].fetch_add(1, Relaxed); }
+                    let mut p_nl = unsafe { ep_end.add(5) };
+                    while unsafe { *p_nl } != b'\n' { p_nl = unsafe { p_nl.add(1) }; }
+                    p = unsafe { p_nl.add(1) };
                 }
-                (counts, errors)
-            })
-        }).collect();
-        let (mut cs, mut es) = (Vec::with_capacity(nt), Vec::with_capacity(nt));
-        for h in hs { let (c, e) = h.join().unwrap(); cs.push(c); es.push(e); }
-        (cs, es)
+            });
+        }
     });
 
-    let (mut starts, mut group_errors, mut cur) = (vec![0u32; total_groups + 1], vec![0u32; total_groups], 0u32);
-    for g in 0..total_groups {
-        starts[g] = cur;
-        let mut sum_e = 0u32;
-        for t in 0..nt {
-            let c = all_counts[t][g];
-            all_counts[t][g] = cur;
-            cur += c;
-            sum_e += all_errors[t][g];
-        }
-        group_errors[g] = sum_e;
-    }
+    let (mut starts, write_pos) = (vec![0u32; total_groups + 1], (0..total_groups).map(|_| AtomicU32::new(0)).collect::<Vec<_>>());
+    let mut cur = 0u32;
+    for g in 0..total_groups { starts[g] = cur; write_pos[g].store(cur, Relaxed); cur += counts[g].load(Relaxed); }
     starts[total_groups] = cur;
-    drop(all_errors);
 
     let mut latencies: Vec<u32> = Vec::with_capacity(cur as usize);
     unsafe { latencies.set_len(cur as usize); }
     let lp = LatPtr(latencies.as_mut_ptr());
 
     std::thread::scope(|sc| {
-        for (t, mut pos) in all_counts.into_iter().enumerate() {
-            let (start, end) = (bounds[t], bounds[t + 1]);
-            let (sl, lp) = (&slots, &lp);
+        for t in 0..nt {
+            let (start, end, sl, lp, wpos) = (bounds[t], bounds[t + 1], &slots, &lp, &write_pos);
             sc.spawn(move || {
-                let (mut p, p_end) = (unsafe { data.as_ptr().add(start) }, unsafe { data.as_ptr().add(end) });
+                let (mut p, p_end, mut ltag, mut lh) = (unsafe { data.as_ptr().add(start) }, unsafe { data.as_ptr().add(end) }, 0u64, 0usize);
                 while p < p_end {
-                    parse_req!(p, sl, num_eps, gid, _err, lat, next_p);
-                    let dst = unsafe { pos.get_unchecked_mut(gid) };
-                    unsafe { *lp.0.add(*dst as usize) = lat; }
-                    *dst += 1;
-                    p = next_p;
+                    parse_line!(p, ltag, lh, sl, num_eps, gid, ep_end, _h, _es);
+                    let mut p_lat = unsafe { ep_end.add(5) };
+                    let mut lat = 0u32;
+                    while unsafe { *p_lat } != b'\n' { lat = lat * 10 + (unsafe { *p_lat } - b'0') as u32; p_lat = unsafe { p_lat.add(1) }; }
+                    p = unsafe { p_lat.add(1) };
+                    unsafe { *lp.0.add(wpos[gid].fetch_add(1, Relaxed) as usize) = lat; }
                 }
             });
         }
     });
+    drop(write_pos);
 
     let (mut pcts, target) = (vec![[0u32; 3]; total_groups], cur as usize / nt + 1);
     std::thread::scope(|sc| {
@@ -280,35 +222,36 @@ fn main() {
     });
     drop(latencies);
 
-    let fmt_hour = |h: usize| -> Vec<u8> {
-        let mut o = Vec::with_capacity(160 << 10);
-        let (abs, d) = (h + 18, 30 + (h + 18) / 24);
-        let (mo, da) = if d <= 31 { (10, d) } else { (11, d - 31) };
-        let hdr = format!("2026-{mo:02}-{da:02}T{:02}:00:00Z ", abs % 24).into_bytes();
-        for rank in 0..num_eps {
-            let gid = h * num_eps + rank;
-            let cnt = starts[gid + 1] - starts[gid];
-            if cnt == 0 { continue; }
-            let e = group_errors[gid];
-            o.extend_from_slice(&hdr);
-            o.extend_from_slice(disc[rank]);
-            for v in [cnt, pcts[gid][0], pcts[gid][1], pcts[gid][2], e] {
-                o.push(b' ');
-                put(&mut o, v as u64);
-            }
-            o.push(b' ');
-            put(&mut o, e as u64 * 1_000_000 / cnt as u64);
-            o.push(b'\n');
-        }
-        o
-    };
+    let h_per_t = (72 + nt - 1) / nt;
+    let (st, errs, d_ref, pc_ref) = (&starts, &errors, &disc, &pcts);
+    let bufs: Vec<Vec<u8>> = std::thread::scope(|sc| {
+        (0..nt).map(|t| {
+            let (h_start, h_end) = ((t * h_per_t).min(72), ((t + 1) * h_per_t).min(72));
+            sc.spawn(move || {
+                let mut chunk_buf = Vec::with_capacity((h_end - h_start) * 160 * 1024);
+                for h in h_start..h_end {
+                    let abs = h + 18;
+                    let d = 30 + abs / 24;
+                    let (mo, da) = if d <= 31 { (10, d) } else { (11, d - 31) };
+                    let hdr = format!("2026-{mo:02}-{da:02}T{:02}:00:00Z ", abs % 24).into_bytes();
+                    for rank in 0..num_eps {
+                        let gid = h * num_eps + rank;
+                        let cnt = st[gid + 1] - st[gid];
+                        if cnt == 0 { continue; }
+                        let e = errs[gid].load(Relaxed);
+                        chunk_buf.extend_from_slice(&hdr);
+                        chunk_buf.extend_from_slice(d_ref[rank]);
+                        for v in [cnt, pc_ref[gid][0], pc_ref[gid][1], pc_ref[gid][2], e] { chunk_buf.push(b' '); put(&mut chunk_buf, v as u64); }
+                        chunk_buf.push(b' ');
+                        put(&mut chunk_buf, e as u64 * 1_000_000 / cnt as u64);
+                        chunk_buf.push(b'\n');
+                    }
+                }
+                chunk_buf
+            })
+        }).collect::<Vec<_>>().into_iter().map(|h| h.join().unwrap()).collect()
+    });
 
-    let mut out_file = File::create(format!("{out_dir}/summary.txt")).expect("create summary.txt");
-    for w in (0..72).step_by(nt) {
-        let bufs: Vec<Vec<u8>> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (w..(w + nt).min(72)).map(|h| sc.spawn(move || fmt_hour(h))).collect();
-            hs.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        for b in bufs { out_file.write_all(&b).unwrap(); }
-    }
+    let mut out_file = File::create(&out_path).expect("create summary");
+    for b in bufs { out_file.write_all(&b).unwrap(); }
 }
