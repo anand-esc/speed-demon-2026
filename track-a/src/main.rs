@@ -1,4 +1,6 @@
-// Track A (Ingest): std-only, zero crates, two-pass zero-allocation architecture.
+// Track A (Ingest): std-only, zero crates, two-pass zero-allocation architecture with SIMD.
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -10,6 +12,27 @@ extern "C" {
 
 const K: u64 = 0x517c_c1b7_2722_0a95;
 const OFF: [usize; 16] = [0, 0, 0, 0, 7, 0, 0, 4, 5, 0, 0, 0, 0, 0, 0, 8];
+
+#[inline(always)]
+unsafe fn find_space(mut p: *const u8) -> *const u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let space_vec = _mm_set1_epi8(b' ' as i8);
+        loop {
+            let v = _mm_loadu_si128(p as *const __m128i);
+            let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, space_vec));
+            if mask != 0 {
+                return p.add(mask.trailing_zeros() as usize);
+            }
+            p = p.add(16);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        while *p != b' ' { p = p.add(1); }
+        p
+    }
+}
 
 #[inline(always)]
 unsafe fn fast_hash(p: *const u8, len: usize) -> u64 {
@@ -50,9 +73,8 @@ macro_rules! parse_req {
         let m0 = unsafe { *$p.add(28) };
         let off = if m0 == b'P' { 4 + (unsafe { *$p.add(29) } == b'O') as usize + (unsafe { *$p.add(29) } == b'A') as usize * 2 } else { OFF[(m0 & 15) as usize] };
         let es = unsafe { $p.add(28 + off) };
-        let mut ep_scan = es;
-        while unsafe { *ep_scan } != b' ' { ep_scan = unsafe { ep_scan.add(1) }; }
-        let ep_len = unsafe { ep_scan.offset_from(es) as usize };
+        let ep_end = unsafe { find_space(es) };
+        let ep_len = unsafe { ep_end.offset_from(es) as usize };
         let h_ep = unsafe { fast_hash(es, ep_len) } | 1;
         let mut idx = (h_ep as usize) & 8191;
         let rank = loop {
@@ -61,8 +83,8 @@ macro_rules! parse_req {
             idx = (idx + 1) & 8191;
         };
         let $gid = h * $num_eps + rank;
-        let $err = unsafe { *ep_scan.add(1) } == b'5';
-        let mut p_lat = unsafe { ep_scan.add(5) };
+        let $err = unsafe { *ep_end.add(1) } == b'5';
+        let mut p_lat = unsafe { ep_end.add(5) };
         let mut $lat = 0u32;
         while unsafe { *p_lat } != b'\n' { $lat = $lat * 10 + (unsafe { *p_lat } - b'0') as u32; p_lat = unsafe { p_lat.add(1) }; }
         let $next_p = unsafe { p_lat.add(1) };
@@ -84,7 +106,6 @@ fn main() {
         madvise(p, len, 2);
         std::slice::from_raw_parts(p, len)
     };
-    let base = data.as_ptr();
 
     let nt = std::thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let mut bounds = vec![0usize];
@@ -95,24 +116,67 @@ fn main() {
     }
     bounds.push(len);
 
-    let (mut disc, mut dh, mut p, p_end) = (Vec::with_capacity(2048), vec![0u64; 8192], base, unsafe { base.add(len.min(6_400_000)) });
-    while p < p_end {
-        let m0 = unsafe { *p.add(28) };
-        let off = if m0 == b'P' { 4 + (unsafe { *p.add(29) } == b'O') as usize + (unsafe { *p.add(29) } == b'A') as usize * 2 } else { OFF[(m0 & 15) as usize] };
-        let es = unsafe { p.add(28 + off) };
-        let mut s = es;
-        while unsafe { *s } != b' ' { s = unsafe { s.add(1) }; }
-        let ep = unsafe { std::slice::from_raw_parts(es, s.offset_from(es) as usize) };
-        let h = unsafe { fast_hash(es, ep.len()) } | 1;
-        let mut idx = (h as usize) & 8191;
-        loop {
-            if dh[idx] == h { break; }
-            if dh[idx] == 0 { dh[idx] = h; disc.push(ep); break; }
-            idx = (idx + 1) & 8191;
+    let prescan_limit = len.min(80_000 * 80);
+    let mut pre_bounds = vec![0usize];
+    for t in 1..nt {
+        let mut s = (prescan_limit / nt * t).max(*pre_bounds.last().unwrap());
+        while s > 0 && s < prescan_limit && data[s - 1] != b'\n' { s += 1; }
+        pre_bounds.push(s);
+    }
+    pre_bounds.push(prescan_limit);
+
+    let local_eps: Vec<Vec<&'static [u8]>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt).map(|t| {
+            let (start, end) = (pre_bounds[t], pre_bounds[t + 1]);
+            sc.spawn(move || {
+                let mut eps = Vec::with_capacity(512);
+                let mut hashes = vec![0u64; 2048];
+                let base = data.as_ptr();
+                let mut p = unsafe { base.add(start) };
+                let p_end = unsafe { base.add(end) };
+                while p < p_end {
+                    let m0 = unsafe { *p.add(28) };
+                    let off = if m0 == b'P' { 4 + (unsafe { *p.add(29) } == b'O') as usize + (unsafe { *p.add(29) } == b'A') as usize * 2 } else { OFF[(m0 & 15) as usize] };
+                    let es = unsafe { p.add(28 + off) };
+                    let ep_end = unsafe { find_space(es) };
+                    let ep_len = unsafe { ep_end.offset_from(es) as usize };
+                    let ep = unsafe { std::slice::from_raw_parts(es, ep_len) };
+
+                    let h = unsafe { fast_hash(es, ep_len) } | 1;
+                    let mut idx = (h as usize) & 2047;
+                    loop {
+                        let sh = hashes[idx];
+                        if sh == h {
+                            break;
+                        } else if sh == 0 {
+                            hashes[idx] = h;
+                            eps.push(ep);
+                            break;
+                        }
+                        idx = (idx + 1) & 2047;
+                    }
+
+                    let mut p_nl = unsafe { ep_end.add(5) };
+                    while unsafe { *p_nl } != b'\n' { p_nl = unsafe { p_nl.add(1) }; }
+                    p = unsafe { p_nl.add(1) };
+                }
+                eps
+            })
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let (mut disc, mut dh) = (Vec::with_capacity(2048), vec![0u64; 8192]);
+    for eps in local_eps {
+        for ep in eps {
+            let h = unsafe { fast_hash(ep.as_ptr(), ep.len()) } | 1;
+            let mut idx = (h as usize) & 8191;
+            loop {
+                if dh[idx] == h { break; }
+                if dh[idx] == 0 { dh[idx] = h; disc.push(ep); break; }
+                idx = (idx + 1) & 8191;
+            }
         }
-        s = unsafe { s.add(5) };
-        while unsafe { *s } != b'\n' { s = unsafe { s.add(1) }; }
-        p = unsafe { s.add(1) };
     }
     disc.sort_unstable();
     let num_eps = disc.len();
@@ -122,7 +186,10 @@ fn main() {
         let h = unsafe { fast_hash(ep.as_ptr(), ep.len()) } | 1;
         let mut idx = (h as usize) & 8191;
         loop {
-            if slots[idx].0 == 0 { slots[idx] = (h, rank as u16, ep.len() as u16); break; }
+            if slots[idx].0 == 0 {
+                slots[idx] = (h, rank as u16, ep.len() as u16);
+                break;
+            }
             idx = (idx + 1) & 8191;
         }
     }
