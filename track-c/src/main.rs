@@ -36,6 +36,12 @@ impl LocalAgg {
     }
 }
 
+#[derive(Clone, Copy)]
+struct NameCacheEntry {
+    hash: u64,
+    nid: u32,
+}
+
 #[inline(always)]
 unsafe fn parse_fast(data: &[u8], p: &mut usize, len: usize) -> (u64, u64, u32, u32, usize, i64) {
     if *p + 2 < len && *data.get_unchecked(*p) == 0xEF && *data.get_unchecked(*p + 1) == 0xBB && *data.get_unchecked(*p + 2) == 0xBF { *p += 3; }
@@ -190,6 +196,7 @@ fn main() -> std::io::Result<()> {
 
             handles.push(s.spawn(move || {
                 let mut aggs = [LocalAgg::EMPTY; 256];
+                let mut n_cache = [NameCacheEntry { hash: 0, nid: 0 }; 4096];
                 let (mut cur_id, mut max_id, mut p) = (0u32, 0u32, chunk_start);
 
                 while p < chunk_end {
@@ -202,22 +209,30 @@ fn main() -> std::io::Result<()> {
                     agg.amount_min = agg.amount_min.min(cents); agg.amount_max = agg.amount_max.max(cents);
                     agg.name_bytes += name_len as u64; agg.note_bytes += note_len as u64;
 
-                    let (h47, mut slot_idx) = (nh & 0x7FFFFFFFFFFF, (nh as usize) & (TABLE_SIZE - 1));
-                    let chosen_nid: u32;
-                    loop {
-                        let slot = unsafe { n_tbl.get_unchecked(slot_idx) };
-                        let val = slot.load(Ordering::Relaxed);
-                        if val == 0 {
-                            if cur_id >= max_id { cur_id = n_blk.fetch_add(512, Ordering::Relaxed); max_id = cur_id + 512; }
-                            let cand_id = cur_id;
-                            cur_id += 1;
-                            match slot.compare_exchange(0, (h47 << 17) | ((cand_id + 1) as u64), Ordering::Relaxed, Ordering::Relaxed) {
-                                Ok(_) => { chosen_nid = cand_id; break; }
-                                Err(act) => { if (act >> 17) == h47 { chosen_nid = (act & 0x1FFFF) as u32 - 1; break; } }
-                            }
-                        } else if (val >> 17) == h47 { chosen_nid = (val & 0x1FFFF) as u32 - 1; break; }
-                        slot_idx = (slot_idx + 1) & (TABLE_SIZE - 1);
-                    }
+                    let c_idx = (nh as usize) & 4095;
+                    let c_entry = unsafe { n_cache.get_unchecked(c_idx) };
+                    let chosen_nid = if c_entry.hash == nh && c_entry.nid != 0 {
+                        c_entry.nid - 1
+                    } else {
+                        let (h47, mut slot_idx) = (nh & 0x7FFFFFFFFFFF, (nh as usize) & (TABLE_SIZE - 1));
+                        let nid: u32;
+                        loop {
+                            let slot = unsafe { n_tbl.get_unchecked(slot_idx) };
+                            let val = slot.load(Ordering::Relaxed);
+                            if val == 0 {
+                                if cur_id >= max_id { cur_id = n_blk.fetch_add(512, Ordering::Relaxed); max_id = cur_id + 512; }
+                                let cand_id = cur_id;
+                                cur_id += 1;
+                                match slot.compare_exchange(0, (h47 << 17) | ((cand_id + 1) as u64), Ordering::Relaxed, Ordering::Relaxed) {
+                                    Ok(_) => { nid = cand_id; break; }
+                                    Err(act) => { if (act >> 17) == h47 { nid = (act & 0x1FFFF) as u32 - 1; break; } }
+                                }
+                            } else if (val >> 17) == h47 { nid = (val & 0x1FFFF) as u32 - 1; break; }
+                            slot_idx = (slot_idx + 1) & (TABLE_SIZE - 1);
+                        }
+                        unsafe { *n_cache.get_unchecked_mut(c_idx) = NameCacheEntry { hash: nh, nid: nid + 1 }; }
+                        nid
+                    };
 
                     let slot = unsafe { c_bits.get_unchecked((cid << 11) + (chosen_nid as usize >> 6)) };
                     let mask = 1u64 << (chosen_nid & 63);
