@@ -14,7 +14,7 @@ fn mmap_file(p: &str) -> &'static [u8] {
     let l = f.metadata().unwrap().size() as usize;
     let fd = f.as_raw_fd();
     unsafe {
-        let ptr = mmap(std::ptr::null_mut(), l, 1, 0x8002, fd, 0);
+        let ptr = mmap(std::ptr::null_mut(), l, 1, 1, fd, 0);
         madvise(ptr, l, 2);
         std::mem::forget(f);
         std::slice::from_raw_parts(ptr, l)
@@ -32,67 +32,84 @@ impl LocalAgg {
     fn merge(&mut self, o: &Self) {
         self.count += o.count; self.id_sum += o.id_sum; self.amount_sum += o.amount_sum;
         self.amount_min = self.amount_min.min(o.amount_min); self.amount_max = self.amount_max.max(o.amount_max);
-        self.name_bytes += o.name_bytes; self.note_bytes += o.note_bytes; self.names_distinct += o.names_distinct;
+        self.name_bytes += o.name_bytes; self.note_bytes += o.note_bytes;
     }
 }
 
 #[inline(always)]
-fn parse_name(data: &[u8], p: &mut usize) -> (u64, u32) {
-    let (mut h, mut len) = (0xcbf29ce484222325u64, 0u32);
-    if unsafe { *data.get_unchecked(*p) } == b'"' {
+unsafe fn parse_fast(data: &[u8], p: &mut usize, len: usize) -> (u64, u64, u32, u32, usize, i64) {
+    if *p + 2 < len && *data.get_unchecked(*p) == 0xEF && *data.get_unchecked(*p + 1) == 0xBB && *data.get_unchecked(*p + 2) == 0xBF { *p += 3; }
+
+    let mut id = 0u64;
+    loop {
+        let b = *data.get_unchecked(*p); *p += 1;
+        if b == b',' { break; }
+        id = id * 10 + (b - b'0') as u64;
+    }
+
+    let (nh, name_len) = if *data.get_unchecked(*p) == b'"' {
         *p += 1;
+        let (mut h, mut nl) = (0xcbf29ce484222325u64, 0u32);
         loop {
-            let b = unsafe { *data.get_unchecked(*p) };
-            *p += 1;
+            let b = *data.get_unchecked(*p); *p += 1;
             if b == b'"' {
-                if *p < data.len() && unsafe { *data.get_unchecked(*p) == b'"' } {
-                    h = (h ^ (b'"' as u64)).wrapping_mul(0x100000001b3); len += 1; *p += 1;
+                if *p < len && *data.get_unchecked(*p) == b'"' {
+                    h = (h ^ (b'"' as u64)).wrapping_mul(0x100000001b3); nl += 1; *p += 1;
                 } else { break; }
-            } else { h = (h ^ (b as u64)).wrapping_mul(0x100000001b3); len += 1; }
+            } else { h = (h ^ (b as u64)).wrapping_mul(0x100000001b3); nl += 1; }
         }
         *p += 1;
+        (h, nl)
     } else {
+        let (mut h, mut nl) = (0xcbf29ce484222325u64, 0u32);
         loop {
-            let b = unsafe { *data.get_unchecked(*p) };
-            *p += 1;
+            let b = *data.get_unchecked(*p); *p += 1;
             if b == b',' { break; }
-            h = (h ^ (b as u64)).wrapping_mul(0x100000001b3); len += 1;
+            h = (h ^ (b as u64)).wrapping_mul(0x100000001b3); nl += 1;
         }
-    }
-    (h, len)
-}
+        (h, nl)
+    };
 
-#[inline(always)]
-fn parse_note_len(data: &[u8], p: &mut usize) -> u32 {
-    let mut len = 0u32;
-    if unsafe { *data.get_unchecked(*p) } == b'"' {
+    let note_len = if *data.get_unchecked(*p) == b'"' {
         *p += 1;
+        let mut nl = 0u32;
         loop {
-            let b = unsafe { *data.get_unchecked(*p) };
-            *p += 1;
+            let b = *data.get_unchecked(*p); *p += 1;
             if b == b'"' {
-                if *p < data.len() && unsafe { *data.get_unchecked(*p) == b'"' } { len += 1; *p += 1; } else { break; }
-            } else { len += 1; }
+                if *p < len && *data.get_unchecked(*p) == b'"' { nl += 1; *p += 1; } else { break; }
+            } else { nl += 1; }
         }
         *p += 1;
+        nl
     } else {
         let start = *p;
-        while unsafe { *data.get_unchecked(*p) } != b',' { *p += 1; }
-        len = (*p - start) as u32; *p += 1;
-    }
-    len
-}
-
-#[inline(always)]
-fn parse_u32(data: &[u8], p: &mut usize) -> u32 {
-    let mut v = 0u32;
-    loop {
-        let b = unsafe { *data.get_unchecked(*p) };
+        while *data.get_unchecked(*p) != b',' { *p += 1; }
+        let nl = (*p - start) as u32;
         *p += 1;
+        nl
+    };
+
+    let mut rid = 0usize;
+    loop {
+        let b = *data.get_unchecked(*p); *p += 1;
         if b == b',' { break; }
-        v = v * 10 + (b - b'0') as u32;
+        rid = rid * 10 + (b - b'0') as usize;
     }
-    v
+
+    let is_neg = if *data.get_unchecked(*p) == b'-' { *p += 1; true } else { false };
+    let mut cents = 0i64;
+    loop {
+        let b = *data.get_unchecked(*p); *p += 1;
+        if b == b'.' { break; }
+        cents = cents * 10 + (b - b'0') as i64;
+    }
+    cents = cents * 100 + ((*data.get_unchecked(*p) - b'0') as i64) * 10 + (*data.get_unchecked(*p + 1) - b'0') as i64;
+    *p += 2;
+    if is_neg { cents = -cents; }
+    if *p < len && *data.get_unchecked(*p) == b'\r' { *p += 1; }
+    if *p < len && *data.get_unchecked(*p) == b'\n' { *p += 1; }
+
+    (id, nh, name_len, note_len, rid, cents)
 }
 
 fn write_money(c: i64, out: &mut String) {
@@ -113,24 +130,28 @@ fn main() -> std::io::Result<()> {
 
     while rp < rlen {
         let mut rid = 0u32;
-        while rp < rlen && rdata[rp] != b',' { rid = rid * 10 + (rdata[rp] - b'0') as u32; rp += 1; }
+        while rp < rlen && unsafe { *rdata.get_unchecked(rp) } != b',' {
+            rid = rid * 10 + (unsafe { *rdata.get_unchecked(rp) } - b'0') as u32;
+            rp += 1;
+        }
         rp += 1;
         if rp + 3 <= rlen {
-            let h = ((rdata[rp] - b'A') as usize) * 676 + ((rdata[rp + 1] - b'A') as usize) * 26 + ((rdata[rp + 2] - b'A') as usize);
+            let h = ((unsafe { *rdata.get_unchecked(rp) } - b'A') as usize) * 676
+                + ((unsafe { *rdata.get_unchecked(rp + 1) } - b'A') as usize) * 26
+                + ((unsafe { *rdata.get_unchecked(rp + 2) } - b'A') as usize);
             let mut cid = code_map[h];
             if cid == 0xFF {
                 cid = country_codes.len() as u8;
                 country_codes.push([rdata[rp], rdata[rp + 1], rdata[rp + 2]]);
                 code_map[h] = cid;
             }
-            if (rid as usize) < 1_000_000 { region_to_country[rid as usize] = cid; }
+            if (rid as usize) < 1_000_000 { unsafe { *region_to_country.get_unchecked_mut(rid as usize) = cid; } }
             rp += 3;
         }
-        while rp < rlen && (rdata[rp] == b'\r' || rdata[rp] == b'\n') { rp += 1; }
+        while rp < rlen && unsafe { *rdata.get_unchecked(rp) } <= b' ' { rp += 1; }
     }
 
     let (unmatched_cid, num_countries) = (country_codes.len() as u8, country_codes.len() + 1);
-    for x in &mut region_to_country { if *x == 255 { *x = unmatched_cid; } }
 
     let data = mmap_file(&format!("{}/records.csv", data_dir));
     let len = data.len();
@@ -172,27 +193,10 @@ fn main() -> std::io::Result<()> {
                 let (mut cur_id, mut max_id, mut p) = (0u32, 0u32, chunk_start);
 
                 while p < chunk_end {
-                    if p + 2 < len && unsafe { *data.get_unchecked(p) == 0xEF && *data.get_unchecked(p + 1) == 0xBB && *data.get_unchecked(p + 2) == 0xBF } { p += 3; }
-                    let id = parse_u32(data, &mut p) as u64;
-                    let (nh, name_len) = parse_name(data, &mut p);
-                    let note_len = parse_note_len(data, &mut p);
-                    let rid = parse_u32(data, &mut p);
+                    let (id, nh, name_len, note_len, rid, cents) = unsafe { parse_fast(data, &mut p, len) };
 
-                    let is_neg = if unsafe { *data.get_unchecked(p) } == b'-' { p += 1; true } else { false };
-                    let mut cents = 0i64;
-                    loop {
-                        let b = unsafe { *data.get_unchecked(p) };
-                        p += 1;
-                        if b == b'.' { break; }
-                        cents = cents * 10 + (b - b'0') as i64;
-                    }
-                    cents = cents * 100 + ((unsafe { *data.get_unchecked(p) } - b'0') as i64) * 10 + (unsafe { *data.get_unchecked(p + 1) } - b'0') as i64;
-                    p += 2;
-                    if is_neg { cents = -cents; }
-                    if p < len && unsafe { *data.get_unchecked(p) == b'\r' } { p += 1; }
-                    if p < len && unsafe { *data.get_unchecked(p) == b'\n' } { p += 1; }
-
-                    let cid = if (rid as usize) < 1_000_000 { unsafe { *r2c.get_unchecked(rid as usize) as usize } } else { unmatched_cid as usize };
+                    let mut cid = if rid < 1_000_000 { unsafe { *r2c.get_unchecked(rid) as usize } } else { unmatched_cid as usize };
+                    if cid == 255 { cid = unmatched_cid as usize; }
                     let agg = &mut aggs[cid];
                     agg.count += 1; agg.id_sum += id as i64; agg.amount_sum += cents;
                     agg.amount_min = agg.amount_min.min(cents); agg.amount_max = agg.amount_max.max(cents);
@@ -217,8 +221,8 @@ fn main() -> std::io::Result<()> {
 
                     let slot = unsafe { c_bits.get_unchecked((cid << 11) + (chosen_nid as usize >> 6)) };
                     let mask = 1u64 << (chosen_nid & 63);
-                    if (slot.load(Ordering::Relaxed) & mask) == 0 && (slot.fetch_or(mask, Ordering::Relaxed) & mask) == 0 {
-                        agg.names_distinct += 1;
+                    if (slot.load(Ordering::Relaxed) & mask) == 0 {
+                        slot.fetch_or(mask, Ordering::Relaxed);
                     }
                 }
                 aggs
@@ -232,6 +236,15 @@ fn main() -> std::io::Result<()> {
     let mut final_aggs = [LocalAgg::EMPTY; 256];
     for tagg in thread_aggs {
         for (i, it) in tagg.iter().enumerate() { final_aggs[i].merge(it); }
+    }
+
+    for c in 0..num_countries {
+        let base = c << 11;
+        let mut distinct = 0u32;
+        for i in 0..2048 {
+            distinct += country_bitsets[base + i].load(Ordering::Relaxed).count_ones();
+        }
+        final_aggs[c].names_distinct = distinct;
     }
 
     let mut order: Vec<usize> = (0..country_codes.len()).collect();
@@ -254,5 +267,5 @@ fn main() -> std::io::Result<()> {
 
     let _ = std::fs::create_dir_all(out_dir);
     File::create(format!("{}/aggregates.txt", out_dir))?.write_all(out.as_bytes())?;
-    Ok(())
+    std::process::exit(0);
 }
