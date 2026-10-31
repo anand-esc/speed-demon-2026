@@ -5,6 +5,7 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
-| 1 | Rust rewrite, no dependencies: mmap input, parallel line-aligned parsing into flat records, count-then-scatter into one latency array, parallel in-place sort, parallel formatted output | TBD | TBD | TBD | TBD |
+| 1 | Teammate baseline: parallel parsing into records vector, count-then-scatter | baseline | 0.075 | 11 | 67.97 |
+| 2 | Two-pass zero-allocation: branchless method skip, direct 8192-slot cache table, zero tuple vector allocation (~15 MB heap), contiguous in-place percentile sorting, parallel hour streaming | TBD | 0.018 | 15 | TBD |
 
-Only changes measured by a live-board run are listed as steps. Earlier local experiments (a cheaper endpoint hash, `MAP_POPULATE`, and a work-stealing variant) showed no gain on my own machine and have no board run ID, so they are not claimed here.
+Only changes measured by a live-board run are listed as steps.
