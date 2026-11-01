@@ -6,7 +6,8 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | Baseline parallel Rust engine: single-direction Dijkstra with atomic CSR | `c468cd2` | 1.110 | 220 | 45.961 |
-| 2 | Bidirectional Dijkstra with Dual-CSR, Unified Epoch Hash Cache, 4-ary QuadHeap, and O(1) Pruning | TBD | ~0.11 | ~68 | TBD |
+| 2 | Bidirectional Dijkstra with Dual-CSR, Unified Epoch Hash Cache, 4-ary QuadHeap, and O(1) Pruning | `224c6a8` | ~0.11 | ~68 | TBD |
+| 3 | In-Place Transmuted CSR, Zero-Copy Raw Pointers, 64-Bit Fibonacci Hash & QuadHeap Hole Sifting | TBD | ~0.05-0.06 | ~54 | TBD |
 
 ## Step 2: High-Performance Bidirectional Dijkstra & Dual CSR Engine
 - **Engine:** Rust 2021 standard library only (`dependency_count = 0`), zero external crate dependencies.
@@ -30,3 +31,21 @@ Every step from the reference to your final version, each with the live-board ru
   - Zero-degree source/target queries pruned in $O(1)$.
   - Symmetric stopping condition: terminates as soon as $f\_top + b\_top \ge \mu$.
   - Cutoff bound halts unreachable queries in milliseconds.
+
+## Step 3: In-Place CSR Transmutation, Zero-Copy Raw Pointers & 64-Bit Avalanche Hashing
+- **In-Place Atomic CSR Transmutation (13.92 MB Heap Eliminated):**
+  - Eliminated separate allocations of `f_head` and `b_head` vectors (13.92 MB total).
+  - The initial prefix sum computes offsets directly into `f_head_atomic` and `b_head_atomic`.
+  - During Pass 2 scattering, edge increments naturally advance `f_head_atomic[u + 1]` by $d_u$, exactly preserving the invariant `head[u]..head[u + 1]` after pass completion.
+  - Transmuted `f_head_atomic` and `b_head_atomic` directly to `raw_f_head` and `raw_b_head` without a single byte copied or reallocated.
+- **Unified Branchless Raw-Pointer Fast Parser:**
+  - Inlined `parse_u32_fast` operating directly on raw byte pointers across all 15,000,000 numbers in `graph.txt` and `queries.txt`.
+  - Removed slice bounds checks, branchy delimiters, and `parse_u32` duplication.
+- **64-Bit Fibonacci Avalanche Multiplier:**
+  - Replaced low-bit truncation `(v * C) & TAB_MASK` (which ignored upper node ID bits and caused severe clustering) with 64-bit golden ratio multiplication and 47-bit shift `((v as u64 * 0x517cc1b727220a95) >> 47) as usize`.
+  - Distributes all 21 bits of $v$ uniformly across the 131,072 table buckets, slashing linear probe chain lengths.
+- **QuadHeap Sift-Up Hole Pattern:**
+  - Avoided redundant intermediate writes during sift-up; only sift down parent values and write item once into final position.
+- **Direct Stack-Buffered Integer Writer & Instant Exit:**
+  - Formatted 64-bit integers directly to a 24-byte stack buffer, bypassing `to_string()` heap allocation.
+  - Added `std::process::exit(0)` to bypass runtime deallocation teardown overhead.
