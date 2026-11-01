@@ -167,14 +167,27 @@ impl QuadHeap {
             loop {
                 let first_child = (i << 2) + 1;
                 if first_child >= len { break; }
-                let mut best_child = first_child;
-                let end = (first_child + 4).min(len);
-                for c in (first_child + 1)..end {
-                    if unsafe { *self.data.get_unchecked(c) < *self.data.get_unchecked(best_child) } {
-                        best_child = c;
+                let (best_child, best_val) = if first_child + 4 <= len {
+                    let c0 = first_child;
+                    let c1 = first_child + 1;
+                    let c2 = first_child + 2;
+                    let c3 = first_child + 3;
+                    let v0 = unsafe { *self.data.get_unchecked(c0) };
+                    let v1 = unsafe { *self.data.get_unchecked(c1) };
+                    let v2 = unsafe { *self.data.get_unchecked(c2) };
+                    let v3 = unsafe { *self.data.get_unchecked(c3) };
+                    let (bc01, bv01) = if v1 < v0 { (c1, v1) } else { (c0, v0) };
+                    let (bc23, bv23) = if v3 < v2 { (c3, v3) } else { (c2, v2) };
+                    if bv23 < bv01 { (bc23, bv23) } else { (bc01, bv01) }
+                } else {
+                    let mut bc = first_child;
+                    let mut bv = unsafe { *self.data.get_unchecked(bc) };
+                    for c in first_child + 1..len {
+                        let cv = unsafe { *self.data.get_unchecked(c) };
+                        if cv < bv { bc = c; bv = cv; }
                     }
-                }
-                let best_val = unsafe { *self.data.get_unchecked(best_child) };
+                    (bc, bv)
+                };
                 if best_val < last {
                     unsafe { *self.data.get_unchecked_mut(i) = best_val; }
                     i = best_child;
@@ -331,20 +344,20 @@ fn main() -> std::io::Result<()> {
     }
 
     let q_workers = 12;
-    let q_chunk = (queries.len() + q_workers - 1) / q_workers;
     let ans_atomic = (0..queries.len()).map(|_| AtomicI64::new(-1)).collect::<Vec<_>>();
-    let (q_ref, fh_ref, bh_ref, fe_ref, be_ref, of_ref, a_ref) = (&queries, &raw_f_head, &raw_b_head, &raw_f_edges, &raw_b_edges, &of_map, &ans_atomic);
+    let next_qi = std::sync::atomic::AtomicUsize::new(0);
+    let (q_ref, fh_ref, bh_ref, fe_ref, be_ref, of_ref, a_ref, nqi_ref) = (&queries, &raw_f_head, &raw_b_head, &raw_f_edges, &raw_b_edges, &of_map, &ans_atomic, &next_qi);
 
     thread::scope(|s| {
-        for t in 0..q_workers {
-            let (st, en) = (t * q_chunk, ((t + 1) * q_chunk).min(q_ref.len()));
-            if st >= en { continue; }
+        for _ in 0..q_workers {
             s.spawn(move || {
                 let mut tab = Table::new();
-                let mut f_heap = QuadHeap::with_capacity(8192);
-                let mut b_heap = QuadHeap::with_capacity(8192);
+                let mut f_heap = QuadHeap::with_capacity(65536);
+                let mut b_heap = QuadHeap::with_capacity(65536);
 
-                for qi in st..en {
+                loop {
+                    let qi = nqi_ref.fetch_add(1, Ordering::Relaxed);
+                    if qi >= q_ref.len() { break; }
                     let (src, tgt) = q_ref[qi];
                     if src == tgt { a_ref[qi].store(0, Ordering::Relaxed); continue; }
                     let (si, ti) = (src as usize, tgt as usize);

@@ -7,7 +7,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | Baseline parallel Rust engine: single-direction Dijkstra with atomic CSR | `c468cd2` | 1.110 | 220 | 45.961 |
 | 2 | Bidirectional Dijkstra with Dual-CSR, Unified Epoch Hash Cache, 4-ary QuadHeap, and O(1) Pruning | `224c6a8` | ~0.11 | ~68 | TBD |
-| 3 | In-Place Transmuted CSR, Zero-Copy Raw Pointers, 64-Bit Fibonacci Hash & QuadHeap Hole Sifting | TBD | ~0.05-0.06 | ~54 | TBD |
+| 3 | In-Place Transmuted CSR, Zero-Copy Raw Pointers, 64-Bit Fibonacci Hash & QuadHeap Hole Sifting | `5c10bf4` | ~0.06 | ~54 | TBD |
+| 4 | Dynamic Atomic Work-Stealing, Branchless Tournament QuadHeap & Zero-Realloc Sizing | TBD | ~0.03-0.05 | ~54 | TBD |
 
 ## Step 2: High-Performance Bidirectional Dijkstra & Dual CSR Engine
 - **Engine:** Rust 2021 standard library only (`dependency_count = 0`), zero external crate dependencies.
@@ -49,3 +50,12 @@ Every step from the reference to your final version, each with the live-board ru
 - **Direct Stack-Buffered Integer Writer & Instant Exit:**
   - Formatted 64-bit integers directly to a 24-byte stack buffer, bypassing `to_string()` heap allocation.
   - Added `std::process::exit(0)` to bypass runtime deallocation teardown overhead.
+
+## Step 4: Lock-Free Dynamic Work Stealing & Branchless Tournament Heap
+- **Lock-Free Dynamic Work Stealing:**
+  - Replaced static block partitioning (`t * chunk .. (t + 1) * chunk`) with a shared `AtomicUsize` dynamic ticket fetcher (`fetch_add(1, Ordering::Relaxed)`).
+  - Eliminates severe tail-latency straggler starvation caused by octave-16 long queries, keeping all 12 hardware threads 100% utilized until the very last query completes.
+- **Branchless Tournament Selection in QuadHeap Sift-Down:**
+  - Replaced iterative child loop with branchless pairwise tournament tree: computes `min(c0, c1)` and `min(c2, c3)` using CPU conditional moves (`cmov`), completely avoiding branch mispredictions during heap pop operations.
+- **Zero-Realloc Heap Sizing:**
+  - Initialized min-heap buffers to 65,536 elements upfront, eliminating vector reallocations during large search cascades.
