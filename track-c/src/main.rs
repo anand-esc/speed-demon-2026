@@ -201,8 +201,7 @@ fn main() -> std::io::Result<()> {
                         cents = cents * 100 + frac;
                         ptr = ptr.add(3);
                         if is_neg { cents = -cents; }
-                        if *ptr == b'\r' { ptr = ptr.add(1); }
-                        if ptr < end_ptr && *ptr == b'\n' { ptr = ptr.add(1); }
+                        if *ptr == b'\r' { ptr = ptr.add(2); } else { ptr = ptr.add(1); }
 
                         let cid = if rid < 1_000_000 { *r2c.get_unchecked(rid) as usize } else { 0 };
                         let agg = aggs.get_unchecked_mut(cid);
@@ -215,7 +214,7 @@ fn main() -> std::io::Result<()> {
                         loop {
                             let slot = n_tbl.get_unchecked(slot_idx);
                             let val = slot.load(Ordering::Relaxed);
-                            if (val >> 17) == h47 {
+                            if (val >> 17) == h47 && val != 0 {
                                 chosen_nid = (val & 0x1FFFF) as u32 - 1;
                                 break;
                             }
