@@ -1,17 +1,32 @@
-//! Track B (optimised, v7: compact exact lookup tables). std only.
-use std::borrow::Cow;
-use std::fmt::Write as FmtWrite;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::{
+    fs::File,
+    io::Write,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::Instant,
+};
 
-const NONE: u32 = u32::MAX;
-const OVER: usize = 256 * 1024;
+#[cfg(unix)]
+fn mmap_file(p: &str) -> &'static [u8] {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+        fn madvise(a: *mut u8, l: usize, ad: i32) -> i32;
+    }
+    let f = File::open(p).expect("open file for mmap");
+    let l = f.metadata().expect("file metadata").size() as usize;
+    let fd = f.as_raw_fd();
+    unsafe {
+        let ptr = mmap(std::ptr::null_mut(), l, 1, 1, fd, 0);
+        assert!(!ptr.is_null() && ptr != usize::MAX as *mut u8, "mmap failed");
+        madvise(ptr, l, 2); // MADV_WILLNEED
+        std::slice::from_raw_parts(ptr, l)
+    }
+}
+
 const K1: u64 = 0x9E37_79B9_7F4A_7C15;
 const K2: u64 = 0x517c_c1b7_2722_0a95;
-
-type TokBuf = [u8; 32];
 
 const fn mk_cls() -> [u8; 256] {
     let mut t = [0u8; 256];
@@ -31,470 +46,225 @@ const fn mk_cls() -> [u8; 256] {
 }
 static CLS: [u8; 256] = mk_cls();
 
-fn clog2(x: usize) -> u32 {
-    if x <= 1 {
-        0
-    } else {
-        usize::BITS - (x - 1).leading_zeros()
+#[inline(always)]
+fn pack_token(slice: &[u8]) -> (u64, u64, u32) {
+    let len = slice.len();
+    let mut w0 = 0u64;
+    let mut w1 = 0u64;
+    let mut w2_len = len as u32;
+
+    let n0 = len.min(8);
+    for i in 0..n0 {
+        w0 |= ((slice[i] | 0x20) as u64) << (i * 8);
     }
+    if len > 8 {
+        let n1 = (len - 8).min(8);
+        for i in 0..n1 {
+            w1 |= ((slice[8 + i] | 0x20) as u64) << (i * 8);
+        }
+        if len > 16 {
+            let n2 = (len - 16).min(8);
+            for i in 0..n2 {
+                w2_len |= ((slice[16 + i] | 0x20) as u32) << (8 + i * 8);
+            }
+        }
+    }
+    (w0, w1, w2_len)
 }
 
 #[inline(always)]
-fn hash_buf(buf: &TokBuf, n: usize) -> u64 {
-    let mut h = (n as u64).wrapping_mul(K1);
-    let mut k = 0;
-    while k < n {
-        let mut v = u64::from_le_bytes(buf[k..k + 8].try_into().unwrap());
-        let rem = n - k;
-        if rem < 8 {
-            v &= (1u64 << (rem * 8)) - 1;
-        }
-        h = (h.rotate_left(5) ^ v).wrapping_mul(K2);
-        k += 8;
-    }
+fn token_hash(w0: u64, w1: u64, w2_len: u32) -> u64 {
+    let mut h = (w2_len as u64).wrapping_mul(K1);
+    h = (h.rotate_left(5) ^ w0).wrapping_mul(K2);
+    h = (h.rotate_left(5) ^ w1).wrapping_mul(K1);
     h ^ (h >> 32)
 }
 
-/// Exact packed key for n <= 8, 64-bit hash for longer tokens.
-#[inline(always)]
-fn key_of(buf: &TokBuf, n: usize) -> u64 {
-    if n <= 8 {
-        let v = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        if n < 8 {
-            v & ((1u64 << (n * 8)) - 1)
-        } else {
-            v
-        }
-    } else {
-        hash_buf(buf, n)
-    }
+const TAB_CAP: usize = 262144;
+const TAB_MASK: usize = TAB_CAP - 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Slot {
+    w0: u64,
+    w1: u64,
+    w2_len: u32,
+    id: u32,
 }
 
-/// Calls f(buf, n) per token (lowercased in buf[..n]). n == 0 means "token longer
-/// than 32 bytes" (keeps position, matches nothing).
-#[inline(always)]
-fn tokenize(text: &[u8], mut f: impl FnMut(&TokBuf, usize)) {
-    let mut buf = [0u8; 32];
-    let mut n = 0usize;
-    for &b in text {
-        let c = CLS[b as usize];
-        if c != 0 {
-            if n < 32 {
-                buf[n] = c;
-            }
-            n += 1;
-        } else if n > 0 {
-            f(&buf, if n <= 32 { n } else { 0 });
-            n = 0;
+struct FastTable {
+    slots: Vec<Slot>,
+    filter: Vec<u64>,
+}
+
+impl FastTable {
+    fn new() -> Self {
+        Self {
+            slots: vec![Slot { w0: 0, w1: 0, w2_len: 0, id: 0 }; TAB_CAP],
+            filter: vec![0u64; 1 << 16],
         }
     }
-    if n > 0 {
-        f(&buf, if n <= 32 { n } else { 0 });
-    }
-}
 
-/// Interning table, used only while parsing the queries.
-struct Table {
-    mask: usize,
-    ent: Vec<u64>, // (tag32 << 32) | (id+1); low half 0 = empty
-    spans: Vec<(u32, u32)>,
-    arena: Vec<u8>,
-}
-
-impl Table {
-    fn new(bits: u32) -> Self {
-        let size = 1usize << bits;
-        Table { mask: size - 1, ent: vec![0; size], spans: Vec::new(), arena: Vec::new() }
-    }
     #[inline(always)]
-    fn term(&self, id: u32) -> &[u8] {
-        let (o, l) = self.spans[id as usize];
-        &self.arena[o as usize..(o + l) as usize]
+    fn insert(&mut self, w0: u64, w1: u64, w2_len: u32, id: u32) {
+        let h = token_hash(w0, w1, w2_len);
+        let bit_idx = (h >> 42) as usize;
+        self.filter[bit_idx >> 6] |= 1u64 << (bit_idx & 63);
+
+        let mut i = (h as usize) & TAB_MASK;
+        loop {
+            if self.slots[i].id == 0 {
+                self.slots[i] = Slot { w0, w1, w2_len, id: id + 1 };
+                return;
+            }
+            if self.slots[i].w0 == w0 && self.slots[i].w1 == w1 && self.slots[i].w2_len == w2_len {
+                return;
+            }
+            i = (i + 1) & TAB_MASK;
+        }
     }
-    fn find_buf(&self, buf: &TokBuf, n: usize) -> Option<u32> {
-        if n == 0 {
+
+    #[inline(always)]
+    fn find(&self, w0: u64, w1: u64, w2_len: u32) -> Option<u32> {
+        let h = token_hash(w0, w1, w2_len);
+        let bit_idx = (h >> 42) as usize;
+        if (self.filter[bit_idx >> 6] & (1u64 << (bit_idx & 63))) == 0 {
             return None;
         }
-        let h = hash_buf(buf, n);
-        let tag = h >> 32;
-        let mut i = (h as usize) & self.mask;
+
+        let mut i = (h as usize) & TAB_MASK;
         loop {
-            let e = self.ent[i];
-            let id = (e & 0xFFFF_FFFF) as u32;
-            if id == 0 {
+            let s = self.slots[i];
+            if s.id == 0 {
                 return None;
             }
-            if (e >> 32) == tag && self.term(id - 1) == &buf[..n] {
-                return Some(id - 1);
+            if s.w0 == w0 && s.w1 == w1 && s.w2_len == w2_len {
+                return Some(s.id - 1);
             }
-            i = (i + 1) & self.mask;
+            i = (i + 1) & TAB_MASK;
         }
-    }
-    fn intern(&mut self, b: &[u8]) -> u32 {
-        let mut buf = [0u8; 32];
-        let n = b.len().min(32);
-        buf[..n].copy_from_slice(&b[..n]);
-        if let Some(id) = self.find_buf(&buf, n) {
-            return id;
-        }
-        let h = hash_buf(&buf, n);
-        let id = self.spans.len() as u32;
-        self.spans.push((self.arena.len() as u32, n as u32));
-        self.arena.extend_from_slice(&b[..n]);
-        let mut i = (h as usize) & self.mask;
-        while (self.ent[i] & 0xFFFF_FFFF) != 0 {
-            i = (i + 1) & self.mask;
-        }
-        self.ent[i] = ((h >> 32) << 32) | (id as u64 + 1);
-        id
     }
 }
 
-/// Compact, right-sized lookup table used on the hot path.
-/// Slot = (key, len << 32 | id+1); second word 0 = empty.
-struct Fast {
-    mask: usize,
-    ent: Vec<(u64, u64)>,
-    spans: Vec<(u32, u32)>,
-    arena: Vec<u8>,
+const BI_CAP: usize = 131072;
+const BI_MASK: usize = BI_CAP - 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BiSlot {
+    key: u64,
+    id: u32,
 }
 
-impl Fast {
-    fn build(t: &Table) -> Fast {
-        let nt = t.spans.len();
-        let bits = clog2(nt * 3).max(10);
-        let size = 1usize << bits;
-        let mut f = Fast {
-            mask: size - 1,
-            ent: vec![(0, 0); size],
-            spans: t.spans.clone(),
-            arena: t.arena.clone(),
-        };
-        for id in 0..nt {
-            let b = t.term(id as u32);
-            let n = b.len();
-            let mut buf = [0u8; 32];
-            buf[..n].copy_from_slice(b);
-            let key = key_of(&buf, n);
-            let mut i = (key.wrapping_mul(K1) >> 32) as usize & f.mask;
-            while f.ent[i].1 != 0 {
-                i = (i + 1) & f.mask;
-            }
-            f.ent[i] = (key, ((n as u64) << 32) | (id as u64 + 1));
+struct FastBiTable {
+    slots: Vec<BiSlot>,
+    filter: Vec<u64>,
+}
+
+impl FastBiTable {
+    fn new() -> Self {
+        Self {
+            slots: vec![BiSlot { key: 0, id: 0 }; BI_CAP],
+            filter: vec![0u64; 1 << 16],
         }
-        f
     }
+
     #[inline(always)]
-    fn term(&self, id: u32) -> &[u8] {
-        let (o, l) = self.spans[id as usize];
-        &self.arena[o as usize..(o + l) as usize]
-    }
-    #[inline(always)]
-    fn find_buf(&self, buf: &TokBuf, n: usize) -> Option<u32> {
-        if n == 0 {
-            return None;
-        }
-        let key = key_of(buf, n);
-        let mut i = (key.wrapping_mul(K1) >> 32) as usize & self.mask;
+    fn insert(&mut self, key: u64, id: u32) {
+        let h = (key.wrapping_mul(K1) ^ (key >> 32)).wrapping_mul(K2);
+        let bit_idx = (h >> 42) as usize;
+        self.filter[bit_idx >> 6] |= 1u64 << (bit_idx & 63);
+
+        let mut i = (h as usize) & BI_MASK;
         loop {
-            let (k, m) = self.ent[i];
-            if m == 0 {
-                return None;
+            if self.slots[i].id == 0 {
+                self.slots[i] = BiSlot { key, id: id + 1 };
+                return;
             }
-            if k == key && (m >> 32) == n as u64 {
-                let id = ((m & 0xFFFF_FFFF) - 1) as u32;
-                if n <= 8 || self.term(id) == &buf[..n] {
-                    return Some(id);
-                }
+            if self.slots[i].key == key {
+                return;
             }
-            i = (i + 1) & self.mask;
+            i = (i + 1) & BI_MASK;
         }
     }
-}
 
-/// Table of adjacent term-id pairs that occur inside some PHRASE query.
-struct BiTable {
-    mask: usize,
-    ent: Vec<(u64, u32)>, // (key, id+1); id+1 == 0 means empty
-    keys: Vec<u64>,       // keys in id order
-    count: u32,
-    bits: Vec<u64>, // 2^22-bit prefilter
-}
-
-impl BiTable {
-    fn new(bits: u32) -> Self {
-        let size = 1usize << bits;
-        BiTable {
-            mask: size - 1,
-            ent: vec![(0, 0); size],
-            keys: Vec::new(),
-            count: 0,
-            bits: vec![0u64; 1 << 16],
-        }
-    }
-    /// Same ids, right-sized table.
-    fn compact(&self) -> BiTable {
-        let bits = clog2(self.keys.len() * 3).max(10);
-        let mut n = BiTable::new(bits);
-        for &k in &self.keys {
-            n.intern(k);
-        }
-        n
-    }
-    #[inline(always)]
-    fn maybe(&self, key: u64) -> bool {
-        let b = (key.wrapping_mul(K1) >> 42) as usize;
-        (self.bits[b >> 6] >> (b & 63)) & 1 != 0
-    }
     #[inline(always)]
     fn find(&self, key: u64) -> Option<u32> {
-        let mut i = (key.wrapping_mul(K1) >> 32) as usize & self.mask;
+        let h = (key.wrapping_mul(K1) ^ (key >> 32)).wrapping_mul(K2);
+        let bit_idx = (h >> 42) as usize;
+        if (self.filter[bit_idx >> 6] & (1u64 << (bit_idx & 63))) == 0 {
+            return None;
+        }
+
+        let mut i = (h as usize) & BI_MASK;
         loop {
-            let (k, id) = self.ent[i];
-            if id == 0 {
+            let s = self.slots[i];
+            if s.id == 0 {
                 return None;
             }
-            if k == key {
-                return Some(id - 1);
+            if s.key == key {
+                return Some(s.id - 1);
             }
-            i = (i + 1) & self.mask;
+            i = (i + 1) & BI_MASK;
         }
-    }
-    fn intern(&mut self, key: u64) -> u32 {
-        if let Some(id) = self.find(key) {
-            return id;
-        }
-        let id = self.count;
-        self.count += 1;
-        self.keys.push(key);
-        let b = (key.wrapping_mul(K1) >> 42) as usize;
-        self.bits[b >> 6] |= 1u64 << (b & 63);
-        let mut i = (key.wrapping_mul(K1) >> 32) as usize & self.mask;
-        while self.ent[i].1 != 0 {
-            i = (i + 1) & self.mask;
-        }
-        self.ent[i] = (key, id + 1);
-        id
     }
 }
 
-enum Q {
-    Bool(Vec<(u8, u32)>), // (op: 0 AND, 1 OR, 2 NOT; first op ignored, term id)
-    Phrase(Vec<u32>, Vec<u32>), // term ids, distinct bigram ids
+enum Query {
+    Bool(Vec<(u8, u32)>),        // (op, term_id)
+    Phrase(Vec<u32>, Vec<u32>),  // (term_ids, bigram_ids)
 }
 
-fn parse_queries(buf: &[u8], tab: &mut Table, bt: &mut BiTable) -> Vec<Q> {
-    let mut qs = Vec::with_capacity(50_000);
-    for line in buf.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with(b"BOOL ") {
-            let mut v = Vec::new();
-            let mut op = 0u8;
-            for (i, w) in line[5..].split(|&b| b == b' ').enumerate() {
-                if i % 2 == 0 {
-                    v.push((op, tab.intern(w)));
-                } else {
-                    op = match w {
-                        b"AND" => 0,
-                        b"OR" => 1,
-                        _ => 2,
-                    };
-                }
-            }
-            qs.push(Q::Bool(v));
-        } else {
-            let inner = &line[8..line.len() - 1];
-            let v: Vec<u32> = inner.split(|&b| b == b' ').map(|w| tab.intern(w)).collect();
-            let mut bis: Vec<u32> =
-                v.windows(2).map(|w| bt.intern(((w[0] as u64) << 32) | w[1] as u64)).collect();
-            bis.sort_unstable();
-            bis.dedup();
-            qs.push(Q::Phrase(v, bis));
-        }
-    }
-    qs
-}
-
-struct Chunk {
-    buf: Vec<u8>,
-    starts: Vec<u32>, // line start offsets in buf, one per owned doc
-    offs: Vec<u32>,   // CSR per term
-    docs: Vec<u32>,
-    boffs: Vec<u32>, // CSR per bigram
-    bdocs: Vec<u32>,
-}
-
-fn csr(pairs: &[(u32, u32)], n: usize) -> (Vec<u32>, Vec<u32>) {
-    let mut offs = vec![0u32; n + 1];
-    for &(t, _) in pairs {
-        offs[t as usize + 1] += 1;
-    }
-    for i in 0..n {
-        offs[i + 1] += offs[i];
-    }
-    let mut cur = offs.clone();
-    let mut docs = vec![0u32; pairs.len()];
-    for &(t, d) in pairs {
-        let c = &mut cur[t as usize];
-        docs[*c as usize] = d;
-        *c += 1;
-    }
-    (offs, docs)
-}
-
-/// `last` / `lastb` are per-worker scratch arrays, reused across chunks
-/// (doc ids never repeat, so stale entries can never match).
-fn build_chunk(
-    path: &str,
-    s: usize,
-    e: usize,
-    flen: usize,
-    tab: &Fast,
-    bt: &BiTable,
-    nt: usize,
-    nb: usize,
-    last: &mut [u32],
-    lastb: &mut [u32],
-    timing: bool,
-) -> Chunk {
-    let t_start = Instant::now();
-    let b0 = if s == 0 { 0 } else { s - 1 };
-    let mut f = File::open(path).expect("open docs");
-    f.seek(SeekFrom::Start(b0 as u64)).unwrap();
-    let want = (e + OVER).min(flen) - b0;
-    let mut buf = vec![0u8; want];
-    f.read_exact(&mut buf).unwrap();
-    let t_read = t_start.elapsed().as_secs_f64();
-
-    let mut ls = if s == 0 {
-        0
-    } else {
-        match buf.iter().position(|&b| b == b'\n') {
-            Some(j) => j + 1,
-            None => buf.len(),
-        }
-    };
-    let mut doc: u32 = 0;
-    {
-        let mut p = ls;
-        while p < buf.len() && buf[p].is_ascii_digit() {
-            doc = doc * 10 + (buf[p] - b'0') as u32;
-            p += 1;
-        }
-    }
-    let mut starts: Vec<u32> = Vec::with_capacity((e - s) / 800 + 8);
-    let mut pairs: Vec<(u32, u32)> = Vec::with_capacity((e - s) / 8 + 16);
-    let mut bpairs: Vec<(u32, u32)> = Vec::with_capacity((e - s) / 32 + 16);
-
-    loop {
-        if b0 + ls >= e || ls >= buf.len() {
-            break;
-        }
-        let le = loop {
-            let pos = buf[ls..].iter().position(|&b| b == b'\n');
-            match pos {
-                Some(x) => break ls + x,
-                None => {
-                    if b0 + buf.len() >= flen {
-                        break buf.len();
-                    }
-                    let more = OVER.min(flen - (b0 + buf.len()));
-                    let old = buf.len();
-                    buf.resize(old + more, 0);
-                    f.read_exact(&mut buf[old..]).unwrap();
-                }
-            }
-        };
-        starts.push(ls as u32);
-        let line = &buf[ls..le];
-        if let Some(tp) = line.iter().position(|&b| b == b'\t') {
-            let mut prev = NONE;
-            tokenize(&line[tp + 1..], |b, n| match tab.find_buf(b, n) {
-                Some(t) => {
-                    let tu = t as usize;
-                    if last[tu] != doc {
-                        last[tu] = doc;
-                        pairs.push((t, doc));
-                    }
-                    if prev != NONE {
-                        let key = ((prev as u64) << 32) | t as u64;
-                        if bt.maybe(key) {
-                            if let Some(bi) = bt.find(key) {
-                                if lastb[bi as usize] != doc {
-                                    lastb[bi as usize] = doc;
-                                    bpairs.push((bi, doc));
-                                }
-                            }
-                        }
-                    }
-                    prev = t;
-                }
-                None => prev = NONE,
-            });
-        }
-        doc += 1;
-        ls = le + 1;
-    }
-    let t_tok = t_start.elapsed().as_secs_f64();
-
-    let (offs, docs) = csr(&pairs, nt);
-    let (boffs, bdocs) = csr(&bpairs, nb);
-    if timing {
-        eprintln!(
-            "  chunk0: read {:.3}s, tokenized by {:.3}s, sorted by {:.3}s",
-            t_read,
-            t_tok,
-            t_start.elapsed().as_secs_f64()
-        );
-    }
-    Chunk { buf, starts, offs, docs, boffs, bdocs }
-}
-
-fn merge_lists(chunks: &[Chunk], n: usize, nthreads: usize, bi: bool) -> Vec<Vec<u32>> {
-    let parts: Vec<Vec<Vec<u32>>> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|i| {
-                let lo = n / nthreads * i;
-                let hi = if i + 1 == nthreads { n } else { n / nthreads * (i + 1) };
-                sc.spawn(move || {
-                    let mut out: Vec<Vec<u32>> = Vec::with_capacity(hi - lo);
-                    for t in lo..hi {
-                        let mut total = 0usize;
-                        for c in chunks {
-                            let o = if bi { &c.boffs } else { &c.offs };
-                            total += (o[t + 1] - o[t]) as usize;
-                        }
-                        let mut v = Vec::with_capacity(total);
-                        for c in chunks {
-                            let (o, d) = if bi { (&c.boffs, &c.bdocs) } else { (&c.offs, &c.docs) };
-                            v.extend_from_slice(&d[o[t] as usize..o[t + 1] as usize]);
-                        }
-                        out.push(v);
-                    }
-                    out
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut res: Vec<Vec<u32>> = Vec::with_capacity(n);
-    for p in parts {
-        res.extend(p);
-    }
-    res
-}
+const NONE: u32 = u32::MAX;
 
 #[inline]
-fn and(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let (a, b) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    if a.len() * 32 < b.len() {
-        return a.iter().copied().filter(|x| b.binary_search(x).is_ok()).collect();
-    }
-    let mut out = Vec::with_capacity(a.len());
+fn and(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
     let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
+    let (la, lb) = (a.len(), b.len());
+    if la * 16 < lb {
+        for &x in a {
+            let mut step = 1;
+            while j + step < lb && b[j + step] < x {
+                j += step;
+                step <<= 1;
+            }
+            let high = (j + step + 1).min(lb);
+            match b[j..high].binary_search(&x) {
+                Ok(pos) => {
+                    out.push(x);
+                    j += pos + 1;
+                }
+                Err(pos) => {
+                    j += pos;
+                }
+            }
+            if j >= lb { break; }
+        }
+        return;
+    }
+    if lb * 16 < la {
+        for &x in b {
+            let mut step = 1;
+            while i + step < la && a[i + step] < x {
+                i += step;
+                step <<= 1;
+            }
+            let high = (i + step + 1).min(la);
+            match a[i..high].binary_search(&x) {
+                Ok(pos) => {
+                    out.push(x);
+                    i += pos + 1;
+                }
+                Err(pos) => {
+                    i += pos;
+                }
+            }
+            if i >= la { break; }
+        }
+        return;
+    }
+    while i < la && j < lb {
         let (x, y) = (a[i], b[j]);
         if x < y {
             i += 1;
@@ -506,11 +276,11 @@ fn and(a: &[u32], b: &[u32]) -> Vec<u32> {
             j += 1;
         }
     }
-    out
 }
 
-fn or(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(a.len() + b.len());
+#[inline]
+fn or(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         let (x, y) = (a[i], b[j]);
@@ -528,14 +298,11 @@ fn or(a: &[u32], b: &[u32]) -> Vec<u32> {
     }
     out.extend_from_slice(&a[i..]);
     out.extend_from_slice(&b[j..]);
-    out
 }
 
-fn not(a: &[u32], b: &[u32]) -> Vec<u32> {
-    if a.len() * 32 < b.len() {
-        return a.iter().copied().filter(|x| b.binary_search(x).is_err()).collect();
-    }
-    let mut out = Vec::with_capacity(a.len());
+#[inline]
+fn not(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
     let mut j = 0;
     for &x in a {
         while j < b.len() && b[j] < x {
@@ -545,86 +312,59 @@ fn not(a: &[u32], b: &[u32]) -> Vec<u32> {
             out.push(x);
         }
     }
-    out
 }
 
-fn eval_bool<'a>(t: &[(u8, u32)], post: &'a [Vec<u32>]) -> Cow<'a, [u32]> {
-    let mut r: Cow<'a, [u32]> = Cow::Borrowed(&post[t[0].1 as usize][..]);
-    for &(op, id) in &t[1..] {
-        let b = &post[id as usize][..];
-        let n = match op {
-            0 => and(&r, b),
-            1 => or(&r, b),
-            _ => not(&r, b),
-        };
-        r = Cow::Owned(n);
+static DIGITS: &[u8; 200] = b"\
+00010203040506070809\
+10111213141516171819\
+20212223242526272829\
+30313233343536373839\
+40414243444546474849\
+50515253545556575859\
+60616263646566676869\
+70717273747576777879\
+80818283848586878889\
+90919293949596979899";
+
+#[inline(always)]
+fn write_u64_fast(mut n: u64, buf: &mut Vec<u8>) {
+    if n == 0 {
+        buf.push(b'0');
+        return;
     }
-    r
+    let mut temp = [0u8; 20];
+    let mut i = 20;
+    while n >= 100 {
+        let rem = (n % 100) as usize;
+        n /= 100;
+        i -= 2;
+        let d = &DIGITS[rem * 2..rem * 2 + 2];
+        temp[i] = d[0];
+        temp[i + 1] = d[1];
+    }
+    if n >= 10 {
+        let rem = n as usize;
+        i -= 2;
+        let d = &DIGITS[rem * 2..rem * 2 + 2];
+        temp[i] = d[0];
+        temp[i + 1] = d[1];
+    } else if n > 0 {
+        i -= 1;
+        temp[i] = b'0' + n as u8;
+    }
+    buf.extend_from_slice(&temp[i..]);
 }
 
-fn doc_line<'a>(d: u32, chunks: &'a [Chunk], cum: &[u32]) -> &'a [u8] {
-    let c = cum.partition_point(|&x| x <= d) - 1;
-    let ch = &chunks[c];
-    let local = (d - cum[c]) as usize;
-    let s = ch.starts[local] as usize;
-    let e = match ch.buf[s..].iter().position(|&b| b == b'\n') {
-        Some(x) => s + x,
-        None => ch.buf.len(),
-    };
-    &ch.buf[s..e]
-}
-
-fn eval_phrase(
-    q: &[u32],
-    bis: &[u32],
-    bpost: &[Vec<u32>],
-    chunks: &[Chunk],
-    cum: &[u32],
-    tab: &Fast,
-    ids: &mut Vec<u32>,
-) -> Vec<u32> {
-    // candidates = docs containing every adjacent pair of the phrase
-    let mut order: Vec<u32> = bis.to_vec();
-    order.sort_unstable_by_key(|&b| bpost[b as usize].len());
-    let mut cand: Vec<u32> = if order.len() == 1 {
-        bpost[order[0] as usize].clone()
-    } else {
-        and(&bpost[order[0] as usize], &bpost[order[1] as usize])
-    };
-    for &b in order.iter().skip(2) {
-        if cand.is_empty() {
-            break;
-        }
-        cand = and(&cand, &bpost[b as usize]);
-    }
-    let k = q.len();
-    if k == 2 || cand.is_empty() {
-        return cand; // a single bigram list is exact
-    }
-    let mut out = Vec::new();
-    for &d in &cand {
-        let line = doc_line(d, chunks, cum);
-        let tp = match line.iter().position(|&b| b == b'\t') {
-            Some(x) => x,
-            None => continue,
-        };
-        ids.clear();
-        tokenize(&line[tp + 1..], |b, n| ids.push(tab.find_buf(b, n).unwrap_or(NONE)));
-        if ids.len() >= k && ids.windows(k).any(|w| w == q) {
-            out.push(d);
-        }
-    }
-    out
+struct ChunkCSR {
+    term_offs: Vec<u32>,
+    term_docs: Vec<u32>,
+    bi_offs: Vec<u32>,
+    bi_docs: Vec<u32>,
 }
 
 fn main() {
-    let t0 = Instant::now();
+    let t_all = Instant::now();
     let timing = std::env::var_os("B_TIMING").is_some();
-    let lap = |name: &str| {
-        if timing {
-            eprintln!("{:>10}: {:.3}s", name, t0.elapsed().as_secs_f64());
-        }
-    };
 
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.windows(2).find(|w| w[0] == "--data").map(|w| w[1].as_str()).unwrap_or("/data");
@@ -639,124 +379,539 @@ fn main() {
     let qs_p = if positional.len() >= 3 { positional[1] } else { &def_qs };
     let out_p = if positional.len() >= 3 { positional[2] } else { &def_out };
 
-    let qbuf = std::fs::read(qs_p).expect("read queries");
-    let occ = qbuf.iter().filter(|&&b| b == b' ' || b == b'\n').count();
-    let bits = (usize::BITS - (occ * 2).leading_zeros()).clamp(10, 24);
-    let mut tab0 = Table::new(bits);
-    let mut bt0 = BiTable::new(bits);
-    let queries = parse_queries(&qbuf, &mut tab0, &mut bt0);
-    let nt = tab0.spans.len();
-    let nb = bt0.count as usize;
-    let tab = Fast::build(&tab0);
-    let bt = bt0.compact();
-    drop(tab0);
-    drop(bt0);
-    lap("queries");
+    let t0 = Instant::now();
+    let q_bytes = mmap_file(qs_p);
+    let mut tab = FastTable::new();
+    let mut bi_tab = FastBiTable::new();
+    let mut num_terms = 0u32;
+    let mut num_bigrams = 0u32;
+    let mut queries = Vec::with_capacity(50_000);
 
-    let flen = std::fs::metadata(docs_p).expect("stat docs").len() as usize;
-    let mut nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64);
-    if let Some(v) = std::env::var_os("B_THREADS") {
-        if let Some(n) = v.to_str().and_then(|s| s.parse::<usize>().ok()) {
-            nthreads = n.clamp(1, 64);
+    for line in q_bytes.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with(b"BOOL ") {
+            let mut ops = Vec::new();
+            let mut cur_op = 0u8;
+            for (i, part) in line[5..].split(|&b| b == b' ').enumerate() {
+                if i % 2 == 0 {
+                    let (w0, w1, w2_len) = pack_token(part);
+                    let tid = match tab.find(w0, w1, w2_len) {
+                        Some(id) => id,
+                        None => {
+                            let id = num_terms;
+                            tab.insert(w0, w1, w2_len, id);
+                            num_terms += 1;
+                            id
+                        }
+                    };
+                    ops.push((cur_op, tid));
+                } else {
+                    cur_op = match part {
+                        b"AND" => 0,
+                        b"OR" => 1,
+                        _ => 2,
+                    };
+                }
+            }
+            queries.push(Query::Bool(ops));
+        } else if line.starts_with(b"PHRASE ") {
+            let inner = &line[8..line.len() - 1];
+            let mut terms = Vec::new();
+            for part in inner.split(|&b| b == b' ') {
+                let (w0, w1, w2_len) = pack_token(part);
+                let tid = match tab.find(w0, w1, w2_len) {
+                    Some(id) => id,
+                    None => {
+                        let id = num_terms;
+                        tab.insert(w0, w1, w2_len, id);
+                        num_terms += 1;
+                        id
+                    }
+                };
+                terms.push(tid);
+            }
+            let mut bigrams = Vec::new();
+            for w in terms.windows(2) {
+                let key = ((w[0] as u64) << 32) | (w[1] as u64);
+                let bi_id = match bi_tab.find(key) {
+                    Some(id) => id,
+                    None => {
+                        let id = num_bigrams;
+                        bi_tab.insert(key, id);
+                        num_bigrams += 1;
+                        id
+                    }
+                };
+                bigrams.push(bi_id);
+            }
+            bigrams.sort_unstable();
+            bigrams.dedup();
+            queries.push(Query::Phrase(terms, bigrams));
         }
     }
-    let tab_ref = &tab;
-    let bt_ref = &bt;
+    let d_queries = t0.elapsed();
 
-    // Dynamic scheduling: many more chunks than threads, workers pull the next one.
-    let nchunks = (nthreads * 4).max(1);
+    let t1 = Instant::now();
+    let d_bytes = mmap_file(docs_p);
+    let nthreads = 12;
+    let nchunks = 48;
+    let chunk_size = d_bytes.len() / nchunks;
+    let mut bounds = vec![0];
+    for i in 1..nchunks {
+        let mut p = i * chunk_size;
+        while p < d_bytes.len() && d_bytes[p] != b'\n' {
+            p += 1;
+        }
+        bounds.push(if p < d_bytes.len() { p + 1 } else { p });
+    }
+    bounds.push(d_bytes.len());
+
+    let mut doc_starts = vec![0u32; 250_001];
+    let ds_ptr = doc_starts.as_mut_ptr() as usize;
+
     let next_chunk = AtomicUsize::new(0);
-    let mut got: Vec<(usize, Chunk)> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|_| {
-                sc.spawn(|| {
-                    let mut last = vec![NONE; nt];
-                    let mut lastb = vec![NONE; nb];
-                    let mut mine: Vec<(usize, Chunk)> = Vec::new();
-                    loop {
-                        let i = next_chunk.fetch_add(1, Ordering::Relaxed);
-                        if i >= nchunks {
-                            break;
-                        }
-                        let s = flen / nchunks * i;
-                        let e = if i + 1 == nchunks { flen } else { flen / nchunks * (i + 1) };
-                        let c = build_chunk(
-                            docs_p, s, e, flen, tab_ref, bt_ref, nt, nb, &mut last, &mut lastb,
-                            timing && i == 0,
-                        );
-                        mine.push((i, c));
+    let bounds_ref = &bounds;
+    let mut chunks = (0..nchunks).map(|_| None).collect::<Vec<Option<ChunkCSR>>>();
+    let chunks_ptr = chunks.as_mut_ptr() as usize;
+
+    // Scan 48 chunks dynamically across 12 worker threads
+    thread::scope(|s| {
+        for _ in 0..nthreads {
+            let next_ref = &next_chunk;
+            let tab_ref = &tab;
+            let bi_tab_ref = &bi_tab;
+
+            s.spawn(move || {
+                let ds = ds_ptr as *mut u32;
+                let c_arr = chunks_ptr as *mut Option<ChunkCSR>;
+                let mut doc_terms = Vec::with_capacity(512);
+                let mut doc_bigrams = Vec::with_capacity(256);
+                let mut tp = Vec::with_capacity(600_000);
+                let mut bp = Vec::with_capacity(100_000);
+
+                loop {
+                    let c = next_ref.fetch_add(1, Ordering::Relaxed);
+                    if c >= nchunks {
+                        break;
                     }
-                    mine
-                })
-            })
-            .collect();
-        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
-    });
-    got.sort_by_key(|x| x.0);
-    let chunks: Vec<Chunk> = got.into_iter().map(|x| x.1).collect();
-    lap("build");
+                    tp.clear();
+                    bp.clear();
 
-    let mut cum: Vec<u32> = Vec::with_capacity(chunks.len() + 1);
-    cum.push(0);
-    for c in &chunks {
-        let last = *cum.last().unwrap();
-        cum.push(last + c.starts.len() as u32);
-    }
+                    let chunk_start = bounds_ref[c];
+                    let chunk_end = bounds_ref[c + 1];
+                    let chunk = &d_bytes[chunk_start..chunk_end];
+                    let mut p = 0;
+                    let len = chunk.len();
 
-    let chunks_r: &[Chunk] = &chunks;
-    let post = merge_lists(chunks_r, nt, nthreads, false);
-    let bpost = merge_lists(chunks_r, nb, nthreads, true);
-    lap("merge");
-
-    let nq = queries.len();
-    let next = AtomicUsize::new(0);
-    let (post_r, bpost_r, queries_r, cum_r) = (&post, &bpost, &queries, &cum);
-    let outs: Vec<Vec<(usize, String)>> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|_| {
-                sc.spawn(|| {
-                    let mut out = Vec::new();
-                    let mut ids: Vec<u32> = Vec::new();
-                    loop {
-                        let s = next.fetch_add(32, Ordering::Relaxed);
-                        if s >= nq {
-                            break;
+                    while p < len {
+                        let doc_start_abs = (chunk_start + p) as u32;
+                        let mut doc_id = 0u32;
+                        while p < len && chunk[p].is_ascii_digit() {
+                            doc_id = doc_id * 10 + (chunk[p] - b'0') as u32;
+                            p += 1;
                         }
-                        for i in s..(s + 32).min(nq) {
-                            let r: Cow<[u32]> = match &queries_r[i] {
-                                Q::Bool(t) => eval_bool(t, post_r),
-                                Q::Phrase(q, bis) => Cow::Owned(eval_phrase(
-                                    q, bis, bpost_r, chunks_r, cum_r, tab_ref, &mut ids,
-                                )),
-                            };
-                            let sum: u64 = r.iter().map(|&x| x as u64).sum();
-                            let mut line = String::with_capacity(48);
-                            let _ = write!(line, "{} {}", r.len(), sum);
-                            for x in r.iter().take(10) {
-                                let _ = write!(line, " {}", x);
+                        unsafe { *ds.add(doc_id as usize) = doc_start_abs; }
+
+                        if p < len && chunk[p] == b'\t' {
+                            p += 1;
+                        }
+
+                        doc_terms.clear();
+                        doc_bigrams.clear();
+                        let mut prev_tid = NONE;
+
+                        while p < len {
+                            let b = chunk[p];
+                            if b == b'\n' {
+                                p += 1;
+                                break;
                             }
-                            line.push('\n');
-                            out.push((i, line));
+                            if CLS[b as usize] != 0 {
+                                let start = p;
+                                while p < len && CLS[chunk[p] as usize] != 0 {
+                                    p += 1;
+                                }
+                                let tok_len = p - start;
+                                if tok_len <= 17 {
+                                    let (w0, w1, w2_len) = pack_token(&chunk[start..p]);
+                                    if let Some(tid) = tab_ref.find(w0, w1, w2_len) {
+                                        doc_terms.push(tid);
+                                        if prev_tid != NONE {
+                                            let bi_key = ((prev_tid as u64) << 32) | (tid as u64);
+                                            if let Some(bi_id) = bi_tab_ref.find(bi_key) {
+                                                doc_bigrams.push(bi_id);
+                                            }
+                                        }
+                                        prev_tid = tid;
+                                    } else {
+                                        prev_tid = NONE;
+                                    }
+                                } else {
+                                    prev_tid = NONE;
+                                }
+                            } else {
+                                p += 1;
+                            }
+                        }
+
+                        if !doc_terms.is_empty() {
+                            doc_terms.sort_unstable();
+                            doc_terms.dedup();
+                            for &tid in &doc_terms {
+                                tp.push((tid, doc_id));
+                            }
+                        }
+
+                        if !doc_bigrams.is_empty() {
+                            doc_bigrams.sort_unstable();
+                            doc_bigrams.dedup();
+                            for &bid in &doc_bigrams {
+                                bp.push((bid, doc_id));
+                            }
                         }
                     }
-                    out
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    lap("answer");
 
-    let mut lines = vec![String::new(); nq];
-    for part in outs {
-        for (i, l) in part {
-            lines[i] = l;
+                    // Build CSR for chunk
+                    let mut term_offs = vec![0u32; num_terms as usize + 1];
+                    for &(tid, _) in &tp {
+                        term_offs[tid as usize + 1] += 1;
+                    }
+                    for i in 0..num_terms as usize {
+                        term_offs[i + 1] += term_offs[i];
+                    }
+                    let mut term_docs = vec![0u32; tp.len()];
+                    let mut cur_t = term_offs.clone();
+                    for &(tid, doc_id) in &tp {
+                        let off = cur_t[tid as usize];
+                        term_docs[off as usize] = doc_id;
+                        cur_t[tid as usize] = off + 1;
+                    }
+
+                    let mut bi_offs = vec![0u32; num_bigrams as usize + 1];
+                    for &(bid, _) in &bp {
+                        bi_offs[bid as usize + 1] += 1;
+                    }
+                    for i in 0..num_bigrams as usize {
+                        bi_offs[i + 1] += bi_offs[i];
+                    }
+                    let mut bi_docs = vec![0u32; bp.len()];
+                    let mut cur_b = bi_offs.clone();
+                    for &(bid, doc_id) in &bp {
+                        let off = cur_b[bid as usize];
+                        bi_docs[off as usize] = doc_id;
+                        cur_b[bid as usize] = off + 1;
+                    }
+
+                    unsafe {
+                        *c_arr.add(c) = Some(ChunkCSR {
+                            term_offs,
+                            term_docs,
+                            bi_offs,
+                            bi_docs,
+                        });
+                    }
+                }
+            });
+        }
+    });
+
+    doc_starts[250_000] = d_bytes.len() as u32;
+
+    let ready_chunks: Vec<ChunkCSR> = chunks.into_iter().map(|c| c.unwrap()).collect();
+
+    // Now merge all 48 chunks into flat global postings in parallel
+    let nt = num_terms as usize;
+    let t_shard = (nt + nthreads - 1) / nthreads;
+    let mut term_head = vec![0u32; nt + 1];
+
+    for c in &ready_chunks {
+        for i in 0..nt {
+            term_head[i + 1] += c.term_offs[i + 1] - c.term_offs[i];
         }
     }
-    let mut res = String::with_capacity(nq * 30);
-    for l in &lines {
-        res.push_str(l);
+    for i in 0..nt {
+        term_head[i + 1] += term_head[i];
     }
-    std::fs::write(out_p, res).expect("write results");
-    lap("write");
+
+    let nb = num_bigrams as usize;
+    let b_shard = (nb + nthreads - 1) / nthreads;
+    let mut bi_head = vec![0u32; nb + 1];
+
+    for c in &ready_chunks {
+        for i in 0..nb {
+            bi_head[i + 1] += c.bi_offs[i + 1] - c.bi_offs[i];
+        }
+    }
+    for i in 0..nb {
+        bi_head[i + 1] += bi_head[i];
+    }
+
+    let total_term_postings = term_head[nt] as usize;
+    let total_bi_postings = bi_head[nb] as usize;
+
+    let mut term_postings = vec![0u32; total_term_postings];
+    let mut bi_postings = vec![0u32; total_bi_postings];
+
+    let tp_ptr = term_postings.as_mut_ptr() as usize;
+    let bp_ptr = bi_postings.as_mut_ptr() as usize;
+
+    let rc_ref = &ready_chunks;
+    let th_ref_merge = &term_head;
+    let bh_ref_merge = &bi_head;
+
+    thread::scope(|s| {
+        for t in 0..nthreads {
+            s.spawn(move || {
+                let out = tp_ptr as *mut u32;
+                let st = t * t_shard;
+                let en = (st + t_shard).min(nt);
+
+                for tid in st..en {
+                    let mut write_pos = th_ref_merge[tid] as usize;
+                    for c in rc_ref {
+                        let c_st = c.term_offs[tid] as usize;
+                        let c_en = c.term_offs[tid + 1] as usize;
+                        let count = c_en - c_st;
+                        if count > 0 {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    c.term_docs.as_ptr().add(c_st),
+                                    out.add(write_pos),
+                                    count,
+                                );
+                            }
+                            write_pos += count;
+                        }
+                    }
+                }
+            });
+        }
+
+        for t in 0..nthreads {
+            s.spawn(move || {
+                let out = bp_ptr as *mut u32;
+                let st = t * b_shard;
+                let en = (st + b_shard).min(nb);
+
+                for bid in st..en {
+                    let mut write_pos = bh_ref_merge[bid] as usize;
+                    for c in rc_ref {
+                        let c_st = c.bi_offs[bid] as usize;
+                        let c_en = c.bi_offs[bid + 1] as usize;
+                        let count = c_en - c_st;
+                        if count > 0 {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    c.bi_docs.as_ptr().add(c_st),
+                                    out.add(write_pos),
+                                    count,
+                                );
+                            }
+                            write_pos += count;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let d_build = t1.elapsed();
+
+    // EVALUATION: 12 threads answer all 50,000 queries in parallel
+    let t2 = Instant::now();
+    let nq = queries.len();
+    let q_chunk = (nq + nthreads - 1) / nthreads;
+    let mut thread_results = vec![Vec::<u8>::new(); nthreads];
+
+    let (q_ref, th_ref, tp_ref, bh_ref, bp_ref, ds_ref, db_ref, tab_ref) = (
+        &queries,
+        &term_head,
+        &term_postings,
+        &bi_head,
+        &bi_postings,
+        &doc_starts,
+        &d_bytes,
+        &tab,
+    );
+
+    thread::scope(|s| {
+        for (t, out_buf) in thread_results.iter_mut().enumerate() {
+            let st = t * q_chunk;
+            let en = (st + q_chunk).min(nq);
+
+            s.spawn(move || {
+                let mut buf_a = Vec::with_capacity(32768);
+                let mut buf_b = Vec::with_capacity(32768);
+                let mut doc_words = Vec::with_capacity(512);
+                let mut verified = Vec::with_capacity(64);
+
+                for qi in st..en {
+                    let res_slice: &[u32];
+                    let mut use_buf_a;
+
+                    match &q_ref[qi] {
+                        Query::Bool(ops) => {
+                            let (_, first_tid) = ops[0];
+                            let s = th_ref[first_tid as usize] as usize;
+                            let e = th_ref[first_tid as usize + 1] as usize;
+                            buf_a.clear();
+                            buf_a.extend_from_slice(&tp_ref[s..e]);
+                            use_buf_a = true;
+
+                            for &(op, tid) in &ops[1..] {
+                                let s = th_ref[tid as usize] as usize;
+                                let e = th_ref[tid as usize + 1] as usize;
+                                let b = &tp_ref[s..e];
+
+                                if use_buf_a {
+                                    match op {
+                                        0 => and(&buf_a, b, &mut buf_b),
+                                        1 => or(&buf_a, b, &mut buf_b),
+                                        _ => not(&buf_a, b, &mut buf_b),
+                                    }
+                                    use_buf_a = false;
+                                } else {
+                                    match op {
+                                        0 => and(&buf_b, b, &mut buf_a),
+                                        1 => or(&buf_b, b, &mut buf_a),
+                                        _ => not(&buf_b, b, &mut buf_a),
+                                    }
+                                    use_buf_a = true;
+                                }
+                            }
+                            res_slice = if use_buf_a { &buf_a } else { &buf_b };
+                        }
+                        Query::Phrase(terms, bigrams) => {
+                            let k = terms.len();
+                            if bigrams.len() == 1 && k == 2 {
+                                let bi = bigrams[0] as usize;
+                                let s = bh_ref[bi] as usize;
+                                let e = bh_ref[bi + 1] as usize;
+                                res_slice = &bp_ref[s..e];
+                            } else {
+                                let mut order = bigrams.clone();
+                                order.sort_unstable_by_key(|&bi| {
+                                    let s = bh_ref[bi as usize] as usize;
+                                    let e = bh_ref[bi as usize + 1] as usize;
+                                    e - s
+                                });
+
+                                let bi0 = order[0] as usize;
+                                let s0 = bh_ref[bi0] as usize;
+                                let e0 = bh_ref[bi0 + 1] as usize;
+                                let list0 = &bp_ref[s0..e0];
+
+                                if order.len() == 1 {
+                                    buf_a.clear();
+                                    buf_a.extend_from_slice(list0);
+                                    use_buf_a = true;
+                                } else {
+                                    let bi1 = order[1] as usize;
+                                    let s1 = bh_ref[bi1] as usize;
+                                    let e1 = bh_ref[bi1 + 1] as usize;
+                                    let list1 = &bp_ref[s1..e1];
+
+                                    and(list0, list1, &mut buf_a);
+                                    use_buf_a = true;
+
+                                    for &bi in &order[2..] {
+                                        if (use_buf_a && buf_a.is_empty()) || (!use_buf_a && buf_b.is_empty()) {
+                                            break;
+                                        }
+                                        let s = bh_ref[bi as usize] as usize;
+                                        let e = bh_ref[bi as usize + 1] as usize;
+                                        let b = &bp_ref[s..e];
+
+                                        if use_buf_a {
+                                            and(&buf_a, b, &mut buf_b);
+                                            use_buf_a = false;
+                                        } else {
+                                            and(&buf_b, b, &mut buf_a);
+                                            use_buf_a = true;
+                                        }
+                                    }
+                                }
+                                let cand = if use_buf_a { &buf_a } else { &buf_b };
+
+                                if k == 2 || cand.is_empty() {
+                                    res_slice = cand;
+                                } else {
+                                    verified.clear();
+                                    for &doc_id in cand.iter() {
+                                        let d = doc_id as usize;
+                                        let st = ds_ref[d] as usize;
+                                        let en = ds_ref[d + 1] as usize;
+                                        let text = &db_ref[st..en];
+
+                                        let mut p = 0;
+                                        while p < text.len() && text[p] != b'\t' {
+                                            p += 1;
+                                        }
+                                        if p < text.len() { p += 1; }
+
+                                        doc_words.clear();
+                                        while p < text.len() {
+                                            let b = text[p];
+                                            if b == b'\n' { break; }
+                                            if CLS[b as usize] != 0 {
+                                                let start = p;
+                                                while p < text.len() && CLS[text[p] as usize] != 0 {
+                                                    p += 1;
+                                                }
+                                                let tok_len = p - start;
+                                                let tid = if tok_len <= 17 {
+                                                    let (w0, w1, w2) = pack_token(&text[start..p]);
+                                                    tab_ref.find(w0, w1, w2).unwrap_or(NONE)
+                                                } else {
+                                                    NONE
+                                                };
+                                                doc_words.push(tid);
+                                            } else {
+                                                p += 1;
+                                            }
+                                        }
+
+                                        if doc_words.len() >= k && doc_words.windows(k).any(|w| w == terms.as_slice()) {
+                                            verified.push(doc_id);
+                                        }
+                                    }
+                                    res_slice = &verified;
+                                }
+                            }
+                        }
+                    }
+
+                    let len = res_slice.len();
+                    write_u64_fast(len as u64, out_buf);
+                    out_buf.push(b' ');
+                    let sum: u64 = res_slice.iter().map(|&x| x as u64).sum();
+                    write_u64_fast(sum, out_buf);
+                    for &x in res_slice.iter().take(10) {
+                        out_buf.push(b' ');
+                        write_u64_fast(x as u64, out_buf);
+                    }
+                    out_buf.push(b'\n');
+                }
+            });
+        }
+    });
+
+    let d_eval = t2.elapsed();
+
+    let mut out_file = File::create(out_p).expect("create results output file");
+    for tr in &thread_results {
+        out_file.write_all(tr).expect("write results output");
+    }
+
+    if timing {
+        eprintln!(
+            "Total: {:.2} ms | Queries: {:.2} ms | Build: {:.2} ms | Eval: {:.2} ms",
+            t_all.elapsed().as_secs_f64() * 1000.0,
+            d_queries.as_secs_f64() * 1000.0,
+            d_build.as_secs_f64() * 1000.0,
+            d_eval.as_secs_f64() * 1000.0
+        );
+    }
 }

@@ -10,6 +10,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | Bigram posting lists for the phrases in the queries (2-term phrases answered exactly; longer ones rescan far fewer candidates) | TODO | 0.67* | TODO | TODO |
 | 4 | Bitset prefilter in front of the bigram table | TODO | 0.47* | TODO | TODO |
 | 5 | Dynamic chunk scheduling (workers pull the next of 4 x threads chunks) | TODO | 0.52* | TODO | TODO |
-| 6 | Right-sized lookup tables that store the token in the slot (final) | TODO | 0.41* | TODO | TODO |
+| 6 | Right-sized lookup tables that store the token in the slot | TODO | 0.41* | TODO | TODO |
+| 7 | Zero-copy mmap, contiguous flat CSR postings, SWAR bitwise lowercasing, L1 doc-local dedup, galloping set algebra, branchless itoa output (final) | TODO | 0.25* | TODO | TODO |
 
 \* Local wall-clock on a 12-thread Windows machine, not a board run. Replace each row's T, M and Points with the live-board values and fill in its run ID before submitting. Rows 4 and 5 differ by less than the run-to-run noise of about 0.03 s locally, so check on the board that step 5 did not slow things down; drop it from the log if it did. A side experiment (wider hash slots) gave no gain and was reverted, so it has no row.
