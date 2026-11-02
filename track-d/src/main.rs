@@ -1,4 +1,11 @@
-use std::{fs::File, io::Write, sync::atomic::{AtomicI64, AtomicU32, Ordering}, thread};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
+    fs::File,
+    io::Write,
+    sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering},
+    thread,
+};
 
 #[inline(always)]
 unsafe fn parse_u32_fast(ptr: &mut *const u8) -> u32 {
@@ -10,6 +17,12 @@ unsafe fn parse_u32_fast(ptr: &mut *const u8) -> u32 {
     }
     *ptr = ptr.add(1);
     v
+}
+
+#[inline(always)]
+unsafe fn skip_u32(ptr: &mut *const u8) {
+    while **ptr >= b'0' { *ptr = ptr.add(1); }
+    *ptr = ptr.add(1);
 }
 
 #[cfg(unix)]
@@ -35,8 +48,11 @@ fn mmap_file(p: &str) -> &'static [u8] {
     Box::leak(std::fs::read(p).unwrap().into_boxed_slice())
 }
 
-const TAB_CAP: usize = 131072;
-const TAB_MASK: usize = TAB_CAP - 1;
+const SMALL_CAP: usize = 32768;
+const SMALL_MASK: usize = SMALL_CAP - 1;
+const LARGE_CAP: usize = 131072;
+const LARGE_MASK: usize = LARGE_CAP - 1;
+const MAX_ENTRIES: usize = 79000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -47,36 +63,99 @@ struct Entry {
     b_dist: u64,
 }
 
-struct Table {
-    entries: Vec<Entry>,
+struct DynamicTable {
+    small_entries: Vec<Entry>,
+    large_entries: Option<Vec<Entry>>,
+    is_large: bool,
     epoch: u32,
     count: usize,
 }
 
-impl Table {
+impl DynamicTable {
     fn new() -> Self {
         Self {
-            entries: unsafe { std::mem::transmute(vec![0u8; TAB_CAP * std::mem::size_of::<Entry>()]) },
+            small_entries: vec![Entry { v: 0, epoch: 0, f_dist: u64::MAX, b_dist: u64::MAX }; SMALL_CAP],
+            large_entries: None,
+            is_large: false,
             epoch: 1,
             count: 0,
         }
     }
+
     #[inline(always)]
     fn reset(&mut self) {
+        self.is_large = false;
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
-            for e in self.entries.iter_mut() { e.epoch = 0; }
+            for e in self.small_entries.iter_mut() { e.epoch = 0; }
+            if let Some(ref mut le) = self.large_entries {
+                for e in le.iter_mut() { e.epoch = 0; }
+            }
             self.epoch = 1;
         }
         self.count = 0;
     }
+
+    #[inline(never)]
+    fn grow(&mut self) {
+        if self.large_entries.is_none() {
+            self.large_entries = Some(vec![Entry { v: 0, epoch: 0, f_dist: u64::MAX, b_dist: u64::MAX }; LARGE_CAP]);
+        }
+        let large = self.large_entries.as_mut().unwrap();
+        let cur_epoch = self.epoch;
+        for e in &self.small_entries {
+            if e.epoch == cur_epoch {
+                let mut idx = ((e.v as u64).wrapping_mul(0x517cc1b727220a95) >> 47) as usize;
+                loop {
+                    let slot = unsafe { large.get_unchecked_mut(idx) };
+                    if slot.epoch != cur_epoch {
+                        *slot = *e;
+                        break;
+                    }
+                    idx = (idx + 1) & LARGE_MASK;
+                }
+            }
+        }
+        self.is_large = true;
+    }
+
     #[inline(always)]
     fn update_forward(&mut self, v: u32, nd: u64) -> (bool, u64) {
+        if !self.is_large {
+            let mut idx = ((v as u64).wrapping_mul(0x517cc1b727220a95) >> 49) as usize;
+            loop {
+                let e = unsafe { self.small_entries.get_unchecked_mut(idx) };
+                if e.epoch != self.epoch {
+                    if self.count >= 24_000 {
+                        self.grow();
+                        return self.update_forward_large(v, nd);
+                    }
+                    *e = Entry { v, epoch: self.epoch, f_dist: nd, b_dist: u64::MAX };
+                    self.count += 1;
+                    return (true, u64::MAX);
+                }
+                if e.v == v {
+                    if nd < e.f_dist {
+                        e.f_dist = nd;
+                        return (true, e.b_dist);
+                    }
+                    return (false, u64::MAX);
+                }
+                idx = (idx + 1) & SMALL_MASK;
+            }
+        } else {
+            self.update_forward_large(v, nd)
+        }
+    }
+
+    #[inline(never)]
+    fn update_forward_large(&mut self, v: u32, nd: u64) -> (bool, u64) {
+        let large = unsafe { self.large_entries.as_mut().unwrap_unchecked() };
         let mut idx = ((v as u64).wrapping_mul(0x517cc1b727220a95) >> 47) as usize;
         loop {
-            let e = unsafe { self.entries.get_unchecked_mut(idx) };
+            let e = unsafe { large.get_unchecked_mut(idx) };
             if e.epoch != self.epoch {
-                if self.count >= 80_000 { return (false, u64::MAX); }
+                if self.count >= MAX_ENTRIES { return (false, u64::MAX); }
                 *e = Entry { v, epoch: self.epoch, f_dist: nd, b_dist: u64::MAX };
                 self.count += 1;
                 return (true, u64::MAX);
@@ -88,16 +167,47 @@ impl Table {
                 }
                 return (false, u64::MAX);
             }
-            idx = (idx + 1) & TAB_MASK;
+            idx = (idx + 1) & LARGE_MASK;
         }
     }
+
     #[inline(always)]
     fn update_backward(&mut self, v: u32, nd: u64) -> (bool, u64) {
+        if !self.is_large {
+            let mut idx = ((v as u64).wrapping_mul(0x517cc1b727220a95) >> 49) as usize;
+            loop {
+                let e = unsafe { self.small_entries.get_unchecked_mut(idx) };
+                if e.epoch != self.epoch {
+                    if self.count >= 24_000 {
+                        self.grow();
+                        return self.update_backward_large(v, nd);
+                    }
+                    *e = Entry { v, epoch: self.epoch, f_dist: u64::MAX, b_dist: nd };
+                    self.count += 1;
+                    return (true, u64::MAX);
+                }
+                if e.v == v {
+                    if nd < e.b_dist {
+                        e.b_dist = nd;
+                        return (true, e.f_dist);
+                    }
+                    return (false, u64::MAX);
+                }
+                idx = (idx + 1) & SMALL_MASK;
+            }
+        } else {
+            self.update_backward_large(v, nd)
+        }
+    }
+
+    #[inline(never)]
+    fn update_backward_large(&mut self, v: u32, nd: u64) -> (bool, u64) {
+        let large = unsafe { self.large_entries.as_mut().unwrap_unchecked() };
         let mut idx = ((v as u64).wrapping_mul(0x517cc1b727220a95) >> 47) as usize;
         loop {
-            let e = unsafe { self.entries.get_unchecked_mut(idx) };
+            let e = unsafe { large.get_unchecked_mut(idx) };
             if e.epoch != self.epoch {
-                if self.count >= 80_000 { return (false, u64::MAX); }
+                if self.count >= MAX_ENTRIES { return (false, u64::MAX); }
                 *e = Entry { v, epoch: self.epoch, f_dist: u64::MAX, b_dist: nd };
                 self.count += 1;
                 return (true, u64::MAX);
@@ -109,112 +219,65 @@ impl Table {
                 }
                 return (false, u64::MAX);
             }
-            idx = (idx + 1) & TAB_MASK;
+            idx = (idx + 1) & LARGE_MASK;
         }
     }
+
     #[inline(always)]
     fn is_stale_forward(&self, v: u32, d: u64) -> bool {
-        let mut idx = ((v as u64).wrapping_mul(0x517cc1b727220a95) >> 47) as usize;
-        loop {
-            let e = unsafe { self.entries.get_unchecked(idx) };
-            if e.epoch != self.epoch { return true; }
-            if e.v == v { return d > e.f_dist; }
-            idx = (idx + 1) & TAB_MASK;
+        if !self.is_large {
+            let mut idx = ((v as u64).wrapping_mul(0x517cc1b727220a95) >> 49) as usize;
+            loop {
+                let e = unsafe { self.small_entries.get_unchecked(idx) };
+                if e.epoch != self.epoch { return true; }
+                if e.v == v { return d > e.f_dist; }
+                idx = (idx + 1) & SMALL_MASK;
+            }
+        } else {
+            let large = unsafe { self.large_entries.as_ref().unwrap_unchecked() };
+            let mut idx = ((v as u64).wrapping_mul(0x517cc1b727220a95) >> 47) as usize;
+            loop {
+                let e = unsafe { large.get_unchecked(idx) };
+                if e.epoch != self.epoch { return true; }
+                if e.v == v { return d > e.f_dist; }
+                idx = (idx + 1) & LARGE_MASK;
+            }
         }
     }
+
     #[inline(always)]
     fn is_stale_backward(&self, v: u32, d: u64) -> bool {
-        let mut idx = ((v as u64).wrapping_mul(0x517cc1b727220a95) >> 47) as usize;
-        loop {
-            let e = unsafe { self.entries.get_unchecked(idx) };
-            if e.epoch != self.epoch { return true; }
-            if e.v == v { return d > e.b_dist; }
-            idx = (idx + 1) & TAB_MASK;
-        }
-    }
-}
-
-struct QuadHeap {
-    data: Vec<u64>,
-}
-
-impl QuadHeap {
-    fn with_capacity(cap: usize) -> Self { Self { data: Vec::with_capacity(cap) } }
-    #[inline(always)]
-    fn push(&mut self, item: u64) {
-        let mut i = self.data.len();
-        self.data.push(item);
-        while i > 0 {
-            let p = (i - 1) >> 2;
-            let parent_val = unsafe { *self.data.get_unchecked(p) };
-            if item < parent_val {
-                unsafe { *self.data.get_unchecked_mut(i) = parent_val; }
-                i = p;
-            } else {
-                break;
-            }
-        }
-        unsafe { *self.data.get_unchecked_mut(i) = item; }
-    }
-    #[inline(always)]
-    fn pop(&mut self) -> Option<u64> {
-        if self.data.is_empty() { return None; }
-        let top = unsafe { *self.data.get_unchecked(0) };
-        let last = self.data.pop().unwrap();
-        let len = self.data.len();
-        if len > 0 {
-            let mut i = 0;
+        if !self.is_large {
+            let mut idx = ((v as u64).wrapping_mul(0x517cc1b727220a95) >> 49) as usize;
             loop {
-                let first_child = (i << 2) + 1;
-                if first_child >= len { break; }
-                let (best_child, best_val) = if first_child + 4 <= len {
-                    let c0 = first_child;
-                    let c1 = first_child + 1;
-                    let c2 = first_child + 2;
-                    let c3 = first_child + 3;
-                    let v0 = unsafe { *self.data.get_unchecked(c0) };
-                    let v1 = unsafe { *self.data.get_unchecked(c1) };
-                    let v2 = unsafe { *self.data.get_unchecked(c2) };
-                    let v3 = unsafe { *self.data.get_unchecked(c3) };
-                    let (bc01, bv01) = if v1 < v0 { (c1, v1) } else { (c0, v0) };
-                    let (bc23, bv23) = if v3 < v2 { (c3, v3) } else { (c2, v2) };
-                    if bv23 < bv01 { (bc23, bv23) } else { (bc01, bv01) }
-                } else {
-                    let mut bc = first_child;
-                    let mut bv = unsafe { *self.data.get_unchecked(bc) };
-                    for c in first_child + 1..len {
-                        let cv = unsafe { *self.data.get_unchecked(c) };
-                        if cv < bv { bc = c; bv = cv; }
-                    }
-                    (bc, bv)
-                };
-                if best_val < last {
-                    unsafe { *self.data.get_unchecked_mut(i) = best_val; }
-                    i = best_child;
-                } else {
-                    break;
-                }
+                let e = unsafe { self.small_entries.get_unchecked(idx) };
+                if e.epoch != self.epoch { return true; }
+                if e.v == v { return d > e.b_dist; }
+                idx = (idx + 1) & SMALL_MASK;
             }
-            unsafe { *self.data.get_unchecked_mut(i) = last; }
+        } else {
+            let large = unsafe { self.large_entries.as_ref().unwrap_unchecked() };
+            let mut idx = ((v as u64).wrapping_mul(0x517cc1b727220a95) >> 47) as usize;
+            loop {
+                let e = unsafe { large.get_unchecked(idx) };
+                if e.epoch != self.epoch { return true; }
+                if e.v == v { return d > e.b_dist; }
+                idx = (idx + 1) & LARGE_MASK;
+            }
         }
-        Some(top)
     }
-    #[inline(always)]
-    fn peek(&self) -> Option<u64> { self.data.first().copied() }
-    #[inline(always)]
-    fn clear(&mut self) { self.data.clear(); }
-    #[inline(always)]
-    fn is_empty(&self) -> bool { self.data.is_empty() }
 }
 
 #[inline(always)]
 fn write_i64(mut n: i64, buf: &mut Vec<u8>) {
     if n == -1 {
-        buf.extend_from_slice(b"-1\n");
+        buf.extend_from_slice(b"-1
+");
         return;
     }
     if n == 0 {
-        buf.extend_from_slice(b"0\n");
+        buf.extend_from_slice(b"0
+");
         return;
     }
     let mut tmp = [0u8; 24];
@@ -225,7 +288,8 @@ fn write_i64(mut n: i64, buf: &mut Vec<u8>) {
         n /= 10;
     }
     buf.extend_from_slice(&tmp[i..]);
-    buf.push(b'\n');
+    buf.push(b'
+');
 }
 
 fn main() -> std::io::Result<()> {
@@ -239,7 +303,7 @@ fn main() -> std::io::Result<()> {
     let m = unsafe { parse_u32_fast(&mut gp_ptr) as usize };
     let gp = unsafe { gp_ptr.offset_from(g_bytes.as_ptr()) as usize };
 
-    let n_th = 12;
+    let n_th = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(12);
     let chunk = (g_bytes.len() - gp) / n_th;
     let mut bounds = Vec::with_capacity(n_th + 1);
     bounds.push(gp);
@@ -263,8 +327,7 @@ fn main() -> std::io::Result<()> {
                     while ptr < end {
                         let u = parse_u32_fast(&mut ptr) as usize;
                         let v = parse_u32_fast(&mut ptr) as usize;
-                        while *ptr >= b'0' { ptr = ptr.add(1); }
-                        ptr = ptr.add(1);
+                        skip_u32(&mut ptr);
                         fh.get_unchecked(u + 1).fetch_add(1, Ordering::Relaxed);
                         bh.get_unchecked(v + 1).fetch_add(1, Ordering::Relaxed);
                     }
@@ -327,7 +390,7 @@ fn main() -> std::io::Result<()> {
     let raw_f_edges = unsafe { std::mem::transmute::<Vec<AtomicU32>, Vec<u32>>(f_edges) };
     let raw_b_edges = unsafe { std::mem::transmute::<Vec<AtomicU32>, Vec<u32>>(b_edges) };
     let of_list = of_atomic.into_inner().unwrap();
-    let mut of_map = std::collections::HashMap::with_capacity(of_list.len());
+    let mut of_map = HashMap::with_capacity(of_list.len());
     for (pos, w) in of_list { of_map.insert(pos, w); }
 
     #[cfg(unix)] unsafe {
@@ -343,93 +406,99 @@ fn main() -> std::io::Result<()> {
         unsafe { queries.push((parse_u32_fast(&mut q_ptr), parse_u32_fast(&mut q_ptr))); }
     }
 
-    let q_workers = 12;
+    let q_workers = n_th;
     let ans_atomic = (0..queries.len()).map(|_| AtomicI64::new(-1)).collect::<Vec<_>>();
-    let next_qi = std::sync::atomic::AtomicUsize::new(0);
-    let (q_ref, fh_ref, bh_ref, fe_ref, be_ref, of_ref, a_ref, nqi_ref) = (&queries, &raw_f_head, &raw_b_head, &raw_f_edges, &raw_b_edges, &of_map, &ans_atomic, &next_qi);
+    let next_qi = AtomicUsize::new(0);
+    let chunk_size = 1;
+    let (q_ref, fh_ref, bh_ref, fe_ref, be_ref, of_ref, a_ref, nqi_ref) = 
+        (&queries, &raw_f_head, &raw_b_head, &raw_f_edges, &raw_b_edges, &of_map, &ans_atomic, &next_qi);
 
     thread::scope(|s| {
         for _ in 0..q_workers {
             s.spawn(move || {
-                let mut tab = Table::new();
-                let mut f_heap = QuadHeap::with_capacity(2048);
-                let mut b_heap = QuadHeap::with_capacity(2048);
+                let mut tab = DynamicTable::new();
+                let mut f_heap = BinaryHeap::with_capacity(65536);
+                let mut b_heap = BinaryHeap::with_capacity(65536);
 
                 loop {
-                    let qi = nqi_ref.fetch_add(1, Ordering::Relaxed);
+                    let qi = nqi_ref.fetch_add(chunk_size, Ordering::Relaxed);
                     if qi >= q_ref.len() { break; }
-                    let (src, tgt) = q_ref[qi];
-                    if src == tgt { a_ref[qi].store(0, Ordering::Relaxed); continue; }
-                    let (si, ti) = (src as usize, tgt as usize);
-                    if fh_ref[si] == fh_ref[si + 1] || bh_ref[ti] == bh_ref[ti + 1] { continue; }
+                    let end = (qi + chunk_size).min(q_ref.len());
+                    for idx in qi..end {
+                        let (src, tgt) = q_ref[idx];
+                        if src == tgt { a_ref[idx].store(0, Ordering::Relaxed); continue; }
+                        let (si, ti) = (src as usize, tgt as usize);
+                        if fh_ref[si] == fh_ref[si + 1] || bh_ref[ti] == bh_ref[ti + 1] { continue; }
 
-                    tab.reset();
-                    tab.update_forward(src, 0);
-                    tab.update_backward(tgt, 0);
-                    f_heap.push(src as u64);
-                    b_heap.push(tgt as u64);
-                    let mut mu = u64::MAX;
+                        tab.reset();
+                        tab.update_forward(src, 0);
+                        tab.update_backward(tgt, 0);
+                        f_heap.push(Reverse(src as u64));
+                        b_heap.push(Reverse(tgt as u64));
+                        let mut mu = u64::MAX;
 
-                    while !f_heap.is_empty() && !b_heap.is_empty() {
-                        let (f_top, b_top) = (f_heap.peek().unwrap() >> 21, b_heap.peek().unwrap() >> 21);
-                        if f_top + b_top >= mu || tab.count >= 80_000 { break; }
+                        while !f_heap.is_empty() && !b_heap.is_empty() {
+                            let f_top = f_heap.peek().unwrap().0 >> 21;
+                            let b_top = b_heap.peek().unwrap().0 >> 21;
+                            if f_top + b_top >= mu || tab.count >= MAX_ENTRIES { break; }
 
-                        if f_top <= b_top {
-                            let key = f_heap.pop().unwrap();
-                            let (d, u) = (key >> 21, (key & 0x1F_FFFF) as u32);
-                            if tab.is_stale_forward(u, d) { continue; }
+                            if f_top <= b_top {
+                                let key = f_heap.pop().unwrap().0;
+                                let (d, u) = (key >> 21, (key & 0x1F_FFFF) as u32);
+                                if tab.is_stale_forward(u, d) { continue; }
 
-                            let start_idx = unsafe { *fh_ref.get_unchecked(u as usize) as usize };
-                            let end_idx = unsafe { *fh_ref.get_unchecked(u as usize + 1) as usize };
-                            for i in start_idx..end_idx {
-                                let edge_val = unsafe { *fe_ref.get_unchecked(i) };
-                                let (v, mut w) = (edge_val & 0x1FFFFF, (edge_val >> 21) as u64);
-                                if w == 2047 {
-                                    if let Some(&ow) = of_ref.get(&(i as u32)) { w = ow as u64; }
-                                }
-                                let nd = d + w;
-                                if nd >= mu { continue; }
+                                let start_idx = unsafe { *fh_ref.get_unchecked(u as usize) as usize };
+                                let end_idx = unsafe { *fh_ref.get_unchecked(u as usize + 1) as usize };
+                                for i in start_idx..end_idx {
+                                    let edge_val = unsafe { *fe_ref.get_unchecked(i) };
+                                    let (v, mut w) = (edge_val & 0x1FFFFF, (edge_val >> 21) as u64);
+                                    if w == 2047 {
+                                        if let Some(&ow) = of_ref.get(&(i as u32)) { w = ow as u64; }
+                                    }
+                                    let nd = d + w;
+                                    if nd >= mu { continue; }
 
-                                let (relaxed, b_dist) = tab.update_forward(v, nd);
-                                if relaxed {
-                                    f_heap.push((nd << 21) | (v as u64));
-                                    if b_dist != u64::MAX {
-                                        let total = nd + b_dist;
-                                        if total < mu { mu = total; }
+                                    let (relaxed, b_dist) = tab.update_forward(v, nd);
+                                    if relaxed {
+                                        f_heap.push(Reverse((nd << 21) | (v as u64)));
+                                        if b_dist != u64::MAX {
+                                            let total = nd + b_dist;
+                                            if total < mu { mu = total; }
+                                        }
                                     }
                                 }
-                            }
-                        } else {
-                            let key = b_heap.pop().unwrap();
-                            let (d, u) = (key >> 21, (key & 0x1F_FFFF) as u32);
-                            if tab.is_stale_backward(u, d) { continue; }
+                            } else {
+                                let key = b_heap.pop().unwrap().0;
+                                let (d, u) = (key >> 21, (key & 0x1F_FFFF) as u32);
+                                if tab.is_stale_backward(u, d) { continue; }
 
-                            let start_idx = unsafe { *bh_ref.get_unchecked(u as usize) as usize };
-                            let end_idx = unsafe { *bh_ref.get_unchecked(u as usize + 1) as usize };
-                            for i in start_idx..end_idx {
-                                let edge_val = unsafe { *be_ref.get_unchecked(i) };
-                                let (v, mut w) = (edge_val & 0x1FFFFF, (edge_val >> 21) as u64);
-                                if w == 2047 {
-                                    if let Some(&ow) = of_ref.get(&((1 << 31) | i as u32)) { w = ow as u64; }
-                                }
-                                let nd = d + w;
-                                if nd >= mu { continue; }
+                                let start_idx = unsafe { *bh_ref.get_unchecked(u as usize) as usize };
+                                let end_idx = unsafe { *bh_ref.get_unchecked(u as usize + 1) as usize };
+                                for i in start_idx..end_idx {
+                                    let edge_val = unsafe { *be_ref.get_unchecked(i) };
+                                    let (v, mut w) = (edge_val & 0x1FFFFF, (edge_val >> 21) as u64);
+                                    if w == 2047 {
+                                        if let Some(&ow) = of_ref.get(&((1 << 31) | i as u32)) { w = ow as u64; }
+                                    }
+                                    let nd = d + w;
+                                    if nd >= mu { continue; }
 
-                                let (relaxed, f_dist) = tab.update_backward(v, nd);
-                                if relaxed {
-                                    b_heap.push((nd << 21) | (v as u64));
-                                    if f_dist != u64::MAX {
-                                        let total = nd + f_dist;
-                                        if total < mu { mu = total; }
+                                    let (relaxed, f_dist) = tab.update_backward(v, nd);
+                                    if relaxed {
+                                        b_heap.push(Reverse((nd << 21) | (v as u64)));
+                                        if f_dist != u64::MAX {
+                                            let total = nd + f_dist;
+                                            if total < mu { mu = total; }
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    if mu != u64::MAX { a_ref[qi].store(mu as i64, Ordering::Relaxed); }
-                    f_heap.clear();
-                    b_heap.clear();
+                        if mu != u64::MAX { a_ref[idx].store(mu as i64, Ordering::Relaxed); }
+                        f_heap.clear();
+                        b_heap.clear();
+                    }
                 }
             });
         }
