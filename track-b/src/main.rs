@@ -30,8 +30,8 @@ fn mmap_file(p: &str) -> &'static [u8] {
     Box::leak(std::fs::read(p).expect("read file").into_boxed_slice())
 }
 
-const K1: u64 = 0x9E37_79B9_7F4A_7C15;
-const K2: u64 = 0x517c_c1b7_2722_0a95;
+const K1: u64 = 0x517c_c1b7_2722_0a95;
+const K2: u64 = 0x9E37_79B9_7F4A_7C15;
 
 const fn mk_cls() -> [u8; 256] {
     let mut t = [0u8; 256];
@@ -52,40 +52,49 @@ const fn mk_cls() -> [u8; 256] {
 static CLS: [u8; 256] = mk_cls();
 
 #[inline(always)]
-fn pack_token(slice: &[u8]) -> (u64, u64, u32) {
-    let len = slice.len();
-    let mut w0 = 0u64;
-    let mut w1 = 0u64;
-    let mut w2_len = len as u32;
-
-    let n0 = len.min(8);
-    for i in 0..n0 {
-        w0 |= ((slice[i] | 0x20) as u64) << (i * 8);
-    }
-    if len > 8 {
-        let n1 = (len - 8).min(8);
-        for i in 0..n1 {
-            w1 |= ((slice[8 + i] | 0x20) as u64) << (i * 8);
-        }
-        if len > 16 {
-            let n2 = (len - 16).min(8);
-            for i in 0..n2 {
-                w2_len |= ((slice[16 + i] | 0x20) as u32) << (8 + i * 8);
+unsafe fn pack_tok_fast(start: *const u8, len: usize, end: *const u8) -> (u64, u64) {
+    if len <= 8 {
+        if start.add(8) <= end {
+            let raw = (start as *const u64).read_unaligned() | 0x2020202020202020;
+            let mask = if len == 8 { u64::MAX } else { (1u64 << (len * 8)) - 1 };
+            (raw & mask, 0)
+        } else {
+            let mut w0 = 0u64;
+            for i in 0..len {
+                w0 |= ((start.add(i).read() | 0x20) as u64) << (i * 8);
             }
+            (w0, 0)
         }
+    } else if len <= 16 {
+        let w0 = if start.add(8) <= end {
+            (start as *const u64).read_unaligned() | 0x2020202020202020
+        } else {
+            let mut w = 0u64;
+            for i in 0..8 { w |= ((start.add(i).read() | 0x20) as u64) << (i * 8); }
+            w
+        };
+        let rem = len - 8;
+        let p2 = start.add(8);
+        let w1 = if p2.add(8) <= end {
+            let raw1 = (p2 as *const u64).read_unaligned() | 0x2020202020202020;
+            let mask1 = if rem == 8 { u64::MAX } else { (1u64 << (rem * 8)) - 1 };
+            raw1 & mask1
+        } else {
+            let mut w = 0u64;
+            for i in 0..rem { w |= ((p2.add(i).read() | 0x20) as u64) << (i * 8); }
+            w
+        };
+        (w0, w1)
+    } else {
+        (0, 0)
     }
-    (w0, w1, w2_len)
 }
 
-#[inline(always)]
-fn token_hash(w0: u64, w1: u64, w2_len: u32) -> u64 {
-    let mut h = (w2_len as u64).wrapping_mul(K1);
-    h = (h.rotate_left(5) ^ w0).wrapping_mul(K2);
-    h = (h.rotate_left(5) ^ w1).wrapping_mul(K1);
-    h ^ (h >> 32)
+fn pack_token_slice(slice: &[u8]) -> (u64, u64) {
+    unsafe { pack_tok_fast(slice.as_ptr(), slice.len(), slice.as_ptr().add(slice.len())) }
 }
 
-const TAB_CAP: usize = 262144;
+const TAB_CAP: usize = 131072;
 const TAB_MASK: usize = TAB_CAP - 1;
 
 #[repr(C)]
@@ -93,8 +102,8 @@ const TAB_MASK: usize = TAB_CAP - 1;
 struct Slot {
     w0: u64,
     w1: u64,
-    w2_len: u32,
     id: u32,
+    _pad: u32,
 }
 
 struct FastTable {
@@ -105,24 +114,24 @@ struct FastTable {
 impl FastTable {
     fn new() -> Self {
         Self {
-            slots: vec![Slot { w0: 0, w1: 0, w2_len: 0, id: 0 }; TAB_CAP],
-            filter: vec![0u64; 1 << 16],
+            slots: vec![Slot { w0: 0, w1: 0, id: 0, _pad: 0 }; TAB_CAP],
+            filter: vec![0u64; 4096], // 32 KB L1 filter
         }
     }
 
     #[inline(always)]
-    fn insert(&mut self, w0: u64, w1: u64, w2_len: u32, id: u32) {
-        let h = token_hash(w0, w1, w2_len);
-        let bit_idx = (h >> 42) as usize;
+    fn insert(&mut self, w0: u64, w1: u64, id: u32) {
+        let h = (w0 ^ w1.rotate_left(17)).wrapping_mul(K1);
+        let bit_idx = ((h >> 46) as usize) & 0x3FFFF;
         self.filter[bit_idx >> 6] |= 1u64 << (bit_idx & 63);
 
         let mut i = (h as usize) & TAB_MASK;
         loop {
             if self.slots[i].id == 0 {
-                self.slots[i] = Slot { w0, w1, w2_len, id: id + 1 };
+                self.slots[i] = Slot { w0, w1, id: id + 1, _pad: 0 };
                 return;
             }
-            if self.slots[i].w0 == w0 && self.slots[i].w1 == w1 && self.slots[i].w2_len == w2_len {
+            if self.slots[i].w0 == w0 && self.slots[i].w1 == w1 {
                 return;
             }
             i = (i + 1) & TAB_MASK;
@@ -130,9 +139,9 @@ impl FastTable {
     }
 
     #[inline(always)]
-    fn find(&self, w0: u64, w1: u64, w2_len: u32) -> Option<u32> {
-        let h = token_hash(w0, w1, w2_len);
-        let bit_idx = (h >> 42) as usize;
+    fn find(&self, w0: u64, w1: u64) -> Option<u32> {
+        let h = (w0 ^ w1.rotate_left(17)).wrapping_mul(K1);
+        let bit_idx = ((h >> 46) as usize) & 0x3FFFF;
         if (self.filter[bit_idx >> 6] & (1u64 << (bit_idx & 63))) == 0 {
             return None;
         }
@@ -143,7 +152,7 @@ impl FastTable {
             if s.id == 0 {
                 return None;
             }
-            if s.w0 == w0 && s.w1 == w1 && s.w2_len == w2_len {
+            if s.w0 == w0 && s.w1 == w1 {
                 return Some(s.id - 1);
             }
             i = (i + 1) & TAB_MASK;
@@ -151,7 +160,7 @@ impl FastTable {
     }
 }
 
-const BI_CAP: usize = 131072;
+const BI_CAP: usize = 65536;
 const BI_MASK: usize = BI_CAP - 1;
 
 #[repr(C)]
@@ -159,6 +168,7 @@ const BI_MASK: usize = BI_CAP - 1;
 struct BiSlot {
     key: u64,
     id: u32,
+    _pad: u32,
 }
 
 struct FastBiTable {
@@ -169,21 +179,21 @@ struct FastBiTable {
 impl FastBiTable {
     fn new() -> Self {
         Self {
-            slots: vec![BiSlot { key: 0, id: 0 }; BI_CAP],
-            filter: vec![0u64; 1 << 16],
+            slots: vec![BiSlot { key: 0, id: 0, _pad: 0 }; BI_CAP],
+            filter: vec![0u64; 2048], // 16 KB L1 filter
         }
     }
 
     #[inline(always)]
     fn insert(&mut self, key: u64, id: u32) {
         let h = (key.wrapping_mul(K1) ^ (key >> 32)).wrapping_mul(K2);
-        let bit_idx = (h >> 42) as usize;
+        let bit_idx = ((h >> 47) as usize) & 0x1FFFF;
         self.filter[bit_idx >> 6] |= 1u64 << (bit_idx & 63);
 
         let mut i = (h as usize) & BI_MASK;
         loop {
             if self.slots[i].id == 0 {
-                self.slots[i] = BiSlot { key, id: id + 1 };
+                self.slots[i] = BiSlot { key, id: id + 1, _pad: 0 };
                 return;
             }
             if self.slots[i].key == key {
@@ -196,7 +206,7 @@ impl FastBiTable {
     #[inline(always)]
     fn find(&self, key: u64) -> Option<u32> {
         let h = (key.wrapping_mul(K1) ^ (key >> 32)).wrapping_mul(K2);
-        let bit_idx = (h >> 42) as usize;
+        let bit_idx = ((h >> 47) as usize) & 0x1FFFF;
         if (self.filter[bit_idx >> 6] & (1u64 << (bit_idx & 63))) == 0 {
             return None;
         }
@@ -216,8 +226,8 @@ impl FastBiTable {
 }
 
 enum Query {
-    Bool(Vec<(u8, u32)>),        // (op, term_id)
-    Phrase(Vec<u32>, Vec<u32>),  // (term_ids, bigram_ids)
+    Bool(Vec<(u8, u32)>),
+    Phrase(Vec<u32>, Vec<u32>),
 }
 
 const NONE: u32 = u32::MAX;
@@ -353,7 +363,7 @@ fn write_u64_fast(mut n: u64, buf: &mut Vec<u8>) {
         let d = &DIGITS[rem * 2..rem * 2 + 2];
         temp[i] = d[0];
         temp[i + 1] = d[1];
-    } else if n > 0 {
+    } else {
         i -= 1;
         temp[i] = b'0' + n as u8;
     }
@@ -401,12 +411,12 @@ fn main() {
             let mut cur_op = 0u8;
             for (i, part) in line[5..].split(|&b| b == b' ').enumerate() {
                 if i % 2 == 0 {
-                    let (w0, w1, w2_len) = pack_token(part);
-                    let tid = match tab.find(w0, w1, w2_len) {
+                    let (w0, w1) = pack_token_slice(part);
+                    let tid = match tab.find(w0, w1) {
                         Some(id) => id,
                         None => {
                             let id = num_terms;
-                            tab.insert(w0, w1, w2_len, id);
+                            tab.insert(w0, w1, id);
                             num_terms += 1;
                             id
                         }
@@ -425,12 +435,12 @@ fn main() {
             let inner = &line[8..line.len() - 1];
             let mut terms = Vec::new();
             for part in inner.split(|&b| b == b' ') {
-                let (w0, w1, w2_len) = pack_token(part);
-                let tid = match tab.find(w0, w1, w2_len) {
+                let (w0, w1) = pack_token_slice(part);
+                let tid = match tab.find(w0, w1) {
                     Some(id) => id,
                     None => {
                         let id = num_terms;
-                        tab.insert(w0, w1, w2_len, id);
+                        tab.insert(w0, w1, id);
                         num_terms += 1;
                         id
                     }
@@ -460,8 +470,8 @@ fn main() {
 
     let t1 = Instant::now();
     let d_bytes = mmap_file(docs_p);
-    let nthreads = 12;
-    let nchunks = 48;
+    let nthreads = std::thread::available_parallelism().map_or(12, |n| n.get()).min(12);
+    let nchunks = 24;
     let chunk_size = d_bytes.len() / nchunks;
     let mut bounds = vec![0];
     for i in 1..nchunks {
@@ -481,7 +491,10 @@ fn main() {
     let mut chunks = (0..nchunks).map(|_| None).collect::<Vec<Option<ChunkCSR>>>();
     let chunks_ptr = chunks.as_mut_ptr() as usize;
 
-    // Scan 48 chunks dynamically across 12 worker threads
+    let nt = num_terms as usize;
+    let nb = num_bigrams as usize;
+
+    // Parallel scanning with O(1) deduplication and fast token parsing
     thread::scope(|s| {
         for _ in 0..nthreads {
             let next_ref = &next_chunk;
@@ -491,10 +504,10 @@ fn main() {
             s.spawn(move || {
                 let ds = ds_ptr as *mut u32;
                 let c_arr = chunks_ptr as *mut Option<ChunkCSR>;
-                let mut doc_terms = Vec::with_capacity(512);
-                let mut doc_bigrams = Vec::with_capacity(256);
-                let mut tp = Vec::with_capacity(150_000);
-                let mut bp = Vec::with_capacity(30_000);
+                let mut last_seen_term = vec![u32::MAX; nt];
+                let mut last_seen_bi = vec![u32::MAX; nb];
+                let mut tp = Vec::with_capacity(65_000);
+                let mut bp = Vec::with_capacity(15_000);
 
                 loop {
                     let c = next_ref.fetch_add(1, Ordering::Relaxed);
@@ -507,83 +520,73 @@ fn main() {
                     let chunk_start = bounds_ref[c];
                     let chunk_end = bounds_ref[c + 1];
                     let chunk = &d_bytes[chunk_start..chunk_end];
-                    let mut p = 0;
                     let len = chunk.len();
 
-                    while p < len {
-                        let doc_start_abs = (chunk_start + p) as u32;
-                        let mut doc_id = 0u32;
-                        while p < len && chunk[p].is_ascii_digit() {
-                            doc_id = doc_id * 10 + (chunk[p] - b'0') as u32;
-                            p += 1;
-                        }
-                        unsafe { *ds.add(doc_id as usize) = doc_start_abs; }
+                    unsafe {
+                        let c_ptr = chunk.as_ptr();
+                        let end_ptr = c_ptr.add(len);
+                        let mut cur = c_ptr;
 
-                        if p < len && chunk[p] == b'\t' {
-                            p += 1;
-                        }
-
-                        doc_terms.clear();
-                        doc_bigrams.clear();
-                        let mut prev_tid = NONE;
-
-                        while p < len {
-                            let b = chunk[p];
-                            if b == b'\n' {
-                                p += 1;
-                                break;
+                        while cur < end_ptr {
+                            let doc_start_abs = (chunk_start + cur.offset_from(c_ptr) as usize) as u32;
+                            let mut doc_id = (*cur - b'0') as u32;
+                            cur = cur.add(1);
+                            while *cur != b'\t' {
+                                doc_id = doc_id * 10 + (*cur - b'0') as u32;
+                                cur = cur.add(1);
                             }
-                            if CLS[b as usize] != 0 {
-                                let start = p;
-                                while p < len && CLS[chunk[p] as usize] != 0 {
-                                    p += 1;
+                            cur = cur.add(1); // skip \t
+                            *ds.add(doc_id as usize) = doc_start_abs;
+
+                            let mut prev_tid = NONE;
+                            while cur < end_ptr {
+                                let b = *cur;
+                                if b == b'\n' {
+                                    cur = cur.add(1);
+                                    break;
                                 }
-                                let tok_len = p - start;
-                                if tok_len <= 17 {
-                                    let (w0, w1, w2_len) = pack_token(&chunk[start..p]);
-                                    if let Some(tid) = tab_ref.find(w0, w1, w2_len) {
-                                        doc_terms.push(tid);
-                                        if prev_tid != NONE {
-                                            let bi_key = ((prev_tid as u64) << 32) | (tid as u64);
-                                            if let Some(bi_id) = bi_tab_ref.find(bi_key) {
-                                                doc_bigrams.push(bi_id);
+                                if CLS[b as usize] != 0 {
+                                    let start = cur;
+                                    while cur < end_ptr && CLS[*cur as usize] != 0 {
+                                        cur = cur.add(1);
+                                    }
+                                    let tok_len = cur.offset_from(start) as usize;
+                                    if tok_len <= 16 {
+                                        let (w0, w1) = pack_tok_fast(start, tok_len, end_ptr);
+                                        if let Some(tid) = tab_ref.find(w0, w1) {
+                                            if *last_seen_term.get_unchecked(tid as usize) != doc_id {
+                                                *last_seen_term.get_unchecked_mut(tid as usize) = doc_id;
+                                                tp.push((tid, doc_id));
                                             }
+                                            if prev_tid != NONE {
+                                                let bi_key = ((prev_tid as u64) << 32) | (tid as u64);
+                                                if let Some(bid) = bi_tab_ref.find(bi_key) {
+                                                    if *last_seen_bi.get_unchecked(bid as usize) != doc_id {
+                                                        *last_seen_bi.get_unchecked_mut(bid as usize) = doc_id;
+                                                        bp.push((bid, doc_id));
+                                                    }
+                                                }
+                                            }
+                                            prev_tid = tid;
+                                        } else {
+                                            prev_tid = NONE;
                                         }
-                                        prev_tid = tid;
                                     } else {
                                         prev_tid = NONE;
                                     }
                                 } else {
-                                    prev_tid = NONE;
+                                    cur = cur.add(1);
                                 }
-                            } else {
-                                p += 1;
-                            }
-                        }
-
-                        if !doc_terms.is_empty() {
-                            doc_terms.sort_unstable();
-                            doc_terms.dedup();
-                            for &tid in &doc_terms {
-                                tp.push((tid, doc_id));
-                            }
-                        }
-
-                        if !doc_bigrams.is_empty() {
-                            doc_bigrams.sort_unstable();
-                            doc_bigrams.dedup();
-                            for &bid in &doc_bigrams {
-                                bp.push((bid, doc_id));
                             }
                         }
                     }
 
                     // Build CSR for chunk
-                    let mut term_offs = vec![0u32; num_terms as usize + 1];
+                    let mut term_offs = vec![0u32; nt + 1];
                     for &(tid, _) in &tp {
                         term_offs[tid as usize + 1] += 1;
                     }
-                    for i in 0..num_terms as usize {
+                    for i in 0..nt {
                         term_offs[i + 1] += term_offs[i];
                     }
                     let mut term_docs = vec![0u32; tp.len()];
@@ -594,11 +597,11 @@ fn main() {
                         cur_t[tid as usize] = off + 1;
                     }
 
-                    let mut bi_offs = vec![0u32; num_bigrams as usize + 1];
+                    let mut bi_offs = vec![0u32; nb + 1];
                     for &(bid, _) in &bp {
                         bi_offs[bid as usize + 1] += 1;
                     }
-                    for i in 0..num_bigrams as usize {
+                    for i in 0..nb {
                         bi_offs[i + 1] += bi_offs[i];
                     }
                     let mut bi_docs = vec![0u32; bp.len()];
@@ -626,8 +629,7 @@ fn main() {
 
     let ready_chunks: Vec<ChunkCSR> = chunks.into_iter().map(|c| c.unwrap()).collect();
 
-    // Now merge all 48 chunks into flat global postings in parallel
-    let nt = num_terms as usize;
+    // Now merge all chunks into flat global postings in parallel
     let t_shard = (nt + nthreads - 1) / nthreads;
     let mut term_head = vec![0u32; nt + 1];
 
@@ -640,7 +642,6 @@ fn main() {
         term_head[i + 1] += term_head[i];
     }
 
-    let nb = num_bigrams as usize;
     let b_shard = (nb + nthreads - 1) / nthreads;
     let mut bi_head = vec![0u32; nb + 1];
 
@@ -730,7 +731,7 @@ fn main() {
 
     let d_build = t1.elapsed();
 
-    // EVALUATION: 12 threads answer all 50,000 queries in parallel
+    // EVALUATION: 12 threads answer all queries in parallel
     let t2 = Instant::now();
     let nq = queries.len();
     let q_chunk = (nq + nthreads - 1) / nthreads;
@@ -869,9 +870,9 @@ fn main() {
                                                     p += 1;
                                                 }
                                                 let tok_len = p - start;
-                                                let tid = if tok_len <= 17 {
-                                                    let (w0, w1, w2) = pack_token(&db_ref[start..p]);
-                                                    tab_ref.find(w0, w1, w2).unwrap_or(NONE)
+                                                let tid = if tok_len <= 16 {
+                                                    let (w0, w1) = pack_token_slice(&db_ref[start..p]);
+                                                    tab_ref.find(w0, w1).unwrap_or(NONE)
                                                 } else {
                                                     NONE
                                                 };

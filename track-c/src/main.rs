@@ -136,6 +136,13 @@ fn main() -> std::io::Result<()> {
                 let mut ptr = unsafe { data.as_ptr().add(chunk_start) };
                 let end_ptr = unsafe { data.as_ptr().add(chunk_end) };
 
+                let r2c_ptr = r2c.as_ptr();
+                let n_tbl_ptr = n_tbl.as_ptr();
+                let c_bits_ptr = c_bits.as_ptr();
+
+                #[cfg(target_arch = "x86_64")]
+                let qv256 = unsafe { _mm256_set1_epi8(b'"' as i8) };
+
                 unsafe {
                     while ptr < end_ptr {
                         if *ptr == 0xEF { ptr = ptr.add(3); }
@@ -173,18 +180,17 @@ fn main() -> std::io::Result<()> {
                             loop {
                                 #[cfg(target_arch = "x86_64")]
                                 {
-                                    let qv = _mm_set1_epi8(b'"' as i8);
-                                    while ptr.add(16) <= end_ptr {
-                                        let v = _mm_loadu_si128(ptr as *const __m128i);
-                                        let m = _mm_movemask_epi8(_mm_cmpeq_epi8(v, qv));
+                                    while ptr.add(32) <= end_ptr {
+                                        let v = _mm256_loadu_si256(ptr as *const __m256i);
+                                        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, qv256)) as u32;
                                         if m != 0 {
                                             let tz = m.trailing_zeros();
                                             nl += tz;
                                             ptr = ptr.add(tz as usize);
                                             break;
                                         }
-                                        nl += 16;
-                                        ptr = ptr.add(16);
+                                        nl += 32;
+                                        ptr = ptr.add(32);
                                     }
                                 }
                                 let b = *ptr; ptr = ptr.add(1);
@@ -221,7 +227,7 @@ fn main() -> std::io::Result<()> {
                         if is_neg { cents = -cents; }
                         if *ptr == b'\r' { ptr = ptr.add(2); } else { ptr = ptr.add(1); }
 
-                        let cid = if rid < 1_000_000 { *r2c.get_unchecked(rid) as usize } else { 0 };
+                        let cid = if rid < 1_000_000 { *r2c_ptr.add(rid) as usize } else { 0 };
                         let agg = aggs.get_unchecked_mut(cid);
                         agg.count += 1; agg.id_sum += id as i64; agg.amount_sum += cents;
                         agg.amount_min = agg.amount_min.min(cents); agg.amount_max = agg.amount_max.max(cents);
@@ -230,7 +236,7 @@ fn main() -> std::io::Result<()> {
                         let (h47, mut slot_idx) = (nh & 0x7FFFFFFFFFFF, (nh as usize) & (TABLE_SIZE - 1));
                         let chosen_nid: u32;
                         loop {
-                            let slot = n_tbl.get_unchecked(slot_idx);
+                            let slot = &*n_tbl_ptr.add(slot_idx);
                             let val = slot.load(Ordering::Relaxed);
                             if (val >> 17) == h47 && val != 0 {
                                 chosen_nid = (val & 0x1FFFF) as u32 - 1;
@@ -248,7 +254,7 @@ fn main() -> std::io::Result<()> {
                             slot_idx = (slot_idx + 1) & (TABLE_SIZE - 1);
                         }
 
-                        let slot = c_bits.get_unchecked((cid << 11) | (chosen_nid as usize >> 6));
+                        let slot = &*c_bits_ptr.add((cid << 11) | (chosen_nid as usize >> 6));
                         let mask = 1u64 << (chosen_nid & 63);
                         if (slot.load(Ordering::Relaxed) & mask) == 0 {
                             slot.fetch_or(mask, Ordering::Relaxed);
