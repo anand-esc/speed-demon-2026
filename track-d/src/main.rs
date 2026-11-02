@@ -352,8 +352,8 @@ fn main() -> std::io::Result<()> {
         for _ in 0..q_workers {
             s.spawn(move || {
                 let mut tab = Table::new();
-                let mut f_heap = QuadHeap::with_capacity(65536);
-                let mut b_heap = QuadHeap::with_capacity(65536);
+                let mut f_heap = QuadHeap::with_capacity(2048);
+                let mut b_heap = QuadHeap::with_capacity(2048);
 
                 loop {
                     let qi = nqi_ref.fetch_add(1, Ordering::Relaxed);

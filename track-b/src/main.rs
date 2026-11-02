@@ -25,6 +25,11 @@ fn mmap_file(p: &str) -> &'static [u8] {
     }
 }
 
+#[cfg(not(unix))]
+fn mmap_file(p: &str) -> &'static [u8] {
+    Box::leak(std::fs::read(p).expect("read file").into_boxed_slice())
+}
+
 const K1: u64 = 0x9E37_79B9_7F4A_7C15;
 const K2: u64 = 0x517c_c1b7_2722_0a95;
 
@@ -488,8 +493,8 @@ fn main() {
                 let c_arr = chunks_ptr as *mut Option<ChunkCSR>;
                 let mut doc_terms = Vec::with_capacity(512);
                 let mut doc_bigrams = Vec::with_capacity(256);
-                let mut tp = Vec::with_capacity(600_000);
-                let mut bp = Vec::with_capacity(100_000);
+                let mut tp = Vec::with_capacity(150_000);
+                let mut bp = Vec::with_capacity(30_000);
 
                 loop {
                     let c = next_ref.fetch_add(1, Ordering::Relaxed);
@@ -717,6 +722,12 @@ fn main() {
         }
     });
 
+    drop(ready_chunks);
+    #[cfg(unix)] unsafe {
+        extern "C" { fn madvise(a: *mut u8, l: usize, ad: i32) -> i32; }
+        madvise(d_bytes.as_ptr() as *mut u8, d_bytes.len(), 4);
+    }
+
     let d_build = t1.elapsed();
 
     // EVALUATION: 12 threads answer all 50,000 queries in parallel
@@ -842,27 +853,24 @@ fn main() {
                                     for &doc_id in cand.iter() {
                                         let d = doc_id as usize;
                                         let st = ds_ref[d] as usize;
-                                        let en = ds_ref[d + 1] as usize;
-                                        let text = &db_ref[st..en];
-
-                                        let mut p = 0;
-                                        while p < text.len() && text[p] != b'\t' {
+                                        let mut p = st;
+                                        while p < db_ref.len() && db_ref[p] != b'\t' {
                                             p += 1;
                                         }
-                                        if p < text.len() { p += 1; }
+                                        if p < db_ref.len() { p += 1; }
 
                                         doc_words.clear();
-                                        while p < text.len() {
-                                            let b = text[p];
+                                        while p < db_ref.len() {
+                                            let b = db_ref[p];
                                             if b == b'\n' { break; }
                                             if CLS[b as usize] != 0 {
                                                 let start = p;
-                                                while p < text.len() && CLS[text[p] as usize] != 0 {
+                                                while p < db_ref.len() && CLS[db_ref[p] as usize] != 0 {
                                                     p += 1;
                                                 }
                                                 let tok_len = p - start;
                                                 let tid = if tok_len <= 17 {
-                                                    let (w0, w1, w2) = pack_token(&text[start..p]);
+                                                    let (w0, w1, w2) = pack_token(&db_ref[start..p]);
                                                     tab_ref.find(w0, w1, w2).unwrap_or(NONE)
                                                 } else {
                                                     NONE
@@ -900,6 +908,7 @@ fn main() {
 
     let d_eval = t2.elapsed();
 
+    let _ = std::fs::create_dir_all(out_dir);
     let mut out_file = File::create(out_p).expect("create results output file");
     for tr in &thread_results {
         out_file.write_all(tr).expect("write results output");
@@ -914,4 +923,5 @@ fn main() {
             d_eval.as_secs_f64() * 1000.0
         );
     }
+    std::process::exit(0);
 }

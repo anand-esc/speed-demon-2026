@@ -1,6 +1,8 @@
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -169,6 +171,22 @@ fn main() -> std::io::Result<()> {
                             ptr = ptr.add(1);
                             let mut nl = 0u32;
                             loop {
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    let qv = _mm_set1_epi8(b'"' as i8);
+                                    while ptr.add(16) <= end_ptr {
+                                        let v = _mm_loadu_si128(ptr as *const __m128i);
+                                        let m = _mm_movemask_epi8(_mm_cmpeq_epi8(v, qv));
+                                        if m != 0 {
+                                            let tz = m.trailing_zeros();
+                                            nl += tz;
+                                            ptr = ptr.add(tz as usize);
+                                            break;
+                                        }
+                                        nl += 16;
+                                        ptr = ptr.add(16);
+                                    }
+                                }
                                 let b = *ptr; ptr = ptr.add(1);
                                 if b == b'"' {
                                     if *ptr == b'"' { nl += 1; ptr = ptr.add(1); } else { break; }

@@ -1,8 +1,11 @@
 // Track A: Shared atomic counts, 15.5MB RSS, 12-thread parallel scatter/format, 0 crates.
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-use std::{fs::File, io::Write, os::fd::AsRawFd, sync::atomic::{AtomicU32, Ordering::Relaxed}};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+use std::{fs::File, io::Write, sync::atomic::{AtomicU32, Ordering::Relaxed}};
 
+#[cfg(unix)]
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
@@ -39,10 +42,40 @@ struct LatPtr(*mut u32);
 unsafe impl Sync for LatPtr {}
 unsafe impl Send for LatPtr {}
 
-fn put(out: &mut Vec<u8>, mut v: u64) {
-    let (mut b, mut i) = ([0u8; 20], 20);
-    loop { i -= 1; b[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
-    out.extend_from_slice(&b[i..]);
+static DIGITS: &[u8; 200] = b"\
+00010203040506070809\
+10111213141516171819\
+20212223242526272829\
+30313233343536373839\
+40414243444546474849\
+50515253545556575859\
+60616263646566676869\
+70717273747576777879\
+80818283848586878889\
+90919293949596979899";
+
+#[inline(always)]
+fn put(buf: &mut Vec<u8>, mut n: u64) {
+    if n == 0 { buf.push(b'0'); return; }
+    let mut temp = [0u8; 20];
+    let mut i = 20;
+    while n >= 100 {
+        let rem = (n % 100) as usize;
+        n /= 100;
+        i -= 2;
+        let d = &DIGITS[rem * 2..rem * 2 + 2];
+        temp[i] = d[0]; temp[i + 1] = d[1];
+    }
+    if n >= 10 {
+        let rem = n as usize;
+        i -= 2;
+        let d = &DIGITS[rem * 2..rem * 2 + 2];
+        temp[i] = d[0]; temp[i + 1] = d[1];
+    } else {
+        i -= 1;
+        temp[i] = b'0' + n as u8;
+    }
+    buf.extend_from_slice(&temp[i..]);
 }
 
 macro_rules! parse_line {
@@ -82,11 +115,14 @@ fn main() {
     let out_path = format!("{out_dir}/summary.txt");
     if len == 0 { let _ = File::create(&out_path); return; }
 
+    #[cfg(unix)]
     let data: &'static [u8] = unsafe {
         let p = mmap(std::ptr::null_mut(), len, 1, 1, file.as_raw_fd(), 0);
         madvise(p, len, 2);
         std::slice::from_raw_parts(p, len)
     };
+    #[cfg(not(unix))]
+    let data: &'static [u8] = Box::leak(std::fs::read(format!("{data_dir}/requests.log")).unwrap().into_boxed_slice());
 
     let nt = std::thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let make_bounds = |limit: usize| {
@@ -211,9 +247,19 @@ fn main() {
                     let n = s.len();
                     if n == 0 { continue; }
                     if n == 1 { out[0] = s[0]; out[1] = s[0]; out[2] = s[0]; }
-                    else {
+                    else if n <= 24 {
                         s.sort_unstable();
                         for (k, pc) in [50usize, 95, 99].into_iter().enumerate() { out[k] = s[(pc * n + 99) / 100 - 1]; }
+                    } else {
+                        let i50 = (50 * n + 99) / 100 - 1;
+                        let i95 = (95 * n + 99) / 100 - 1;
+                        let i99 = (99 * n + 99) / 100 - 1;
+                        s.select_nth_unstable(i95);
+                        out[1] = s[i95];
+                        s[..i95].select_nth_unstable(i50);
+                        out[0] = s[i50];
+                        s[i95 + 1..].select_nth_unstable(i99 - (i95 + 1));
+                        out[2] = s[i99];
                     }
                 }
             });
@@ -254,4 +300,5 @@ fn main() {
 
     let mut out_file = File::create(&out_path).expect("create summary");
     for b in bufs { out_file.write_all(&b).unwrap(); }
+    std::process::exit(0);
 }
